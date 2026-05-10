@@ -2,6 +2,7 @@ import argparse
 import sys
 
 import compress
+import decompress
 import search
 
 EXAMPLES = """
@@ -10,6 +11,8 @@ examples:
   shrinker compress server.log server.logz --format json
   shrinker search server.logz "payment failed"
   shrinker search server.logz "500"
+  shrinker decompress archive.logz --output restored.log
+  shrinker decompress archive.logz > restored.log
 """
 
 
@@ -31,6 +34,10 @@ def build_parser():
     s.add_argument('file', help='Input .logz file path')
     s.add_argument('query', help='Search query string')
 
+    d = sub.add_parser('decompress', help='Decompress a .logz file back to original bytes')
+    d.add_argument('file', help='Input .logz file path')
+    d.add_argument('--output', metavar='filename', help='Write output to file instead of stdout')
+
     return parser
 
 
@@ -44,6 +51,8 @@ def main():
         compress.run(args)
     elif args.command == 'search':
         search.run(args)
+    elif args.command == 'decompress':
+        decompress.run(args)
 
 
 if __name__ == '__main__':
