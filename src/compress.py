@@ -4,9 +4,12 @@ import struct
 import sys
 import zstandard as zstd
 
+import bloom
+
 CHUNK_SIZE = 64 * 1024
 DICT_SIZE = 112 * 1024
 TRAIN_LIMIT = 10 * 1024 * 1024
+VERSION = 2
 
 FORMAT_JSON = 0
 FORMAT_SYSLOG = 1
@@ -78,11 +81,11 @@ def _compress(input_path, output_path, fmt_name=None):
         compressor = zstd.ZstdCompressor(level=3)
 
     input_size = 0
-    jump_table = []
+    jump_table = []  # (chunk_offset, comp_size, orig_size, bloom_bytes)
 
     with open(input_path, 'rb') as fin, open(output_path, 'wb') as fout:
         fout.write(b'LOGZ')
-        fout.write(struct.pack('<H', 1))
+        fout.write(struct.pack('<H', VERSION))
         fout.write(struct.pack('B', fmt))
         fout.write(struct.pack('<I', len(dict_data)))
         fout.write(dict_data)
@@ -92,21 +95,28 @@ def _compress(input_path, output_path, fmt_name=None):
             if not raw:
                 break
             input_size += len(raw)
+            bf = bloom.build(raw)
             chunk_offset = fout.tell()
             comp = compressor.compress(raw)
             fout.write(comp)
-            jump_table.append((chunk_offset, len(comp), len(raw)))
+            jump_table.append((chunk_offset, len(comp), len(raw), bf))
 
         jump_table_offset = fout.tell()
-        for offset, comp_size, orig_size in jump_table:
+        for offset, comp_size, orig_size, bf in jump_table:
             fout.write(struct.pack('<QII', offset, comp_size, orig_size))
+            fout.write(bf)
         fout.write(struct.pack('<QI', jump_table_offset, len(jump_table)))
 
         output_size = fout.tell()
 
+    num_chunks = len(jump_table)
+    bloom_kb = num_chunks * bloom.BLOOM_BYTES / 1024
+    bloom_pct = num_chunks * bloom.BLOOM_BYTES / output_size * 100 if output_size else 0
     ratio = input_size / output_size if output_size else 0
+
     print(f"Format:  {FORMAT_NAMES[fmt]}", file=sys.stderr)
     print(f"Input:   {input_size / 1024 / 1024:.2f} MB", file=sys.stderr)
     print(f"Output:  {output_size / 1024 / 1024:.2f} MB", file=sys.stderr)
     print(f"Ratio:   {ratio:.2f}x", file=sys.stderr)
-    print(f"Chunks:  {len(jump_table)}", file=sys.stderr)
+    print(f"Chunks:  {num_chunks}", file=sys.stderr)
+    print(f"Bloom:   {bloom_kb:.1f} KB ({bloom_pct:.1f}% of output)", file=sys.stderr)
