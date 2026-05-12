@@ -4,9 +4,10 @@
 A single-binary CLI tool that compresses log files into .logz format
 and allows instant search without full decompression.
 
-## Two commands, that's it:
+## Three commands:
 shrinker compress server.log output.logz
 shrinker search output.logz "payment failed"
+shrinker decompress output.logz --output restored.log
 
 ## Proven benchmark numbers (already validated):
 - Compression: 3.46x on synthetic JSON logs (6-10x expected on real logs)
@@ -27,16 +28,16 @@ shrinker search output.logz "payment failed"
 [NUM_CHUNKS: 4 bytes]
 
 ## Current phase:
-Python prototype. Phase 2 complete (bloom filters). Next: decompress.py + tests.
+Python prototype. Phase 3 complete (decompress + lossless round-trip verified). Next: tests.
 
 ## File structure:
 shrinker/
   src/
     compress.py    # format detection, dict training, chunked compress, bloom build
     search.py      # jump table read, bloom pre-filter, surgical decompression
+    decompress.py  # reads .logz, verifies magic, decompresses all chunks in order
     bloom.py       # 1024-byte bloom filter: djb2 + fnv1a + sdbm hash functions
-    decompress.py  # rehydrates .logz back to original bytes (not yet built)
-    cli.py         # argparse entry point: compress / search subcommands
+    cli.py         # argparse entry point: compress / search / decompress subcommands
   tests/
     test_compress.py   # not yet built
     test_search.py     # not yet built
@@ -50,7 +51,8 @@ shrinker/
 - Tokens split on: spaces, quotes, colons, newlines, commas, braces, brackets
 - Jump table at file tail like Parquet footer — seek to EOF-12 to bootstrap reads
 - search.py reads version byte and handles v1 (no bloom) and v2 (bloom) files
-- Rehydration to original bytes must be 100% lossless (bit-exact round-trip)
+- Rehydration to original bytes is 100% lossless — verified with diff (bit-exact round-trip)
+- decompress.py verifies MAGIC bytes on open, exits with error if file is not .logz
 
 ## What we are NOT building:
 - Not a database
