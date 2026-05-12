@@ -1,3 +1,5 @@
+"""Compress log files into the .logz seekable compressed format."""
+
 import json
 import re
 import struct
@@ -6,10 +8,11 @@ import zstandard as zstd
 
 import bloom
 
-CHUNK_SIZE = 64 * 1024
-DICT_SIZE = 112 * 1024
-TRAIN_LIMIT = 10 * 1024 * 1024
-VERSION = 2
+CHUNK_SIZE = 64 * 1024   # 64 KB — SIMD-aligned for the future C rewrite
+DICT_SIZE = 112 * 1024   # zstd dictionary target size in bytes
+TRAIN_LIMIT = 10 * 1024 * 1024  # cap dictionary training at 10 MB so startup stays fast
+
+VERSION = 2  # v1 = no bloom filters, v2 = bloom in jump table
 
 FORMAT_JSON = 0
 FORMAT_SYSLOG = 1
@@ -21,6 +24,18 @@ SYSLOG_RE = re.compile(r'^\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s')
 
 
 def detect_format(path):
+    """Detect whether a log file contains JSON, syslog, or plaintext lines.
+
+    Reads up to the first five lines and applies a majority vote: if at least
+    min(3, len(lines)) lines match a format, that format wins. Falls back to
+    plaintext when nothing matches.
+
+    Args:
+        path: Path to the input log file.
+
+    Returns:
+        One of FORMAT_JSON, FORMAT_SYSLOG, or FORMAT_PLAINTEXT.
+    """
     lines = []
     with open(path, 'rb') as f:
         for _ in range(5):
@@ -30,6 +45,7 @@ def detect_format(path):
             lines.append(line.decode('utf-8', errors='replace').rstrip())
     if not lines:
         return FORMAT_PLAINTEXT
+    # Majority threshold: require at least 3 matching lines, or all lines if fewer than 3
     threshold = max(1, min(3, len(lines)))
     if sum(1 for l in lines if _try_json(l)) >= threshold:
         return FORMAT_JSON
@@ -39,6 +55,14 @@ def detect_format(path):
 
 
 def _try_json(line):
+    """Return True if line is valid JSON, False otherwise.
+
+    Args:
+        line: A single log line as a string.
+
+    Returns:
+        bool
+    """
     try:
         json.loads(line)
         return True
@@ -47,6 +71,18 @@ def _try_json(line):
 
 
 def _train_dict(path):
+    """Train a zstd shared dictionary on the first TRAIN_LIMIT bytes of a file.
+
+    A shared dictionary dramatically improves compression on small, similarly
+    structured chunks (JSON log lines). Returns None if there are fewer than
+    two samples — zstd requires at least two to train.
+
+    Args:
+        path: Path to the input log file used as training corpus.
+
+    Returns:
+        A zstd.ZstdCompressionDict, or None if training was skipped or failed.
+    """
     samples = []
     total = 0
     with open(path, 'rb') as f:
@@ -57,6 +93,7 @@ def _train_dict(path):
             samples.append(chunk)
             total += len(chunk)
     if len(samples) < 2:
+        # zstd train_dictionary raises ZstdError with fewer than 2 samples
         return None
     try:
         return zstd.train_dictionary(DICT_SIZE, samples)
@@ -65,10 +102,29 @@ def _train_dict(path):
 
 
 def run(args):
+    """CLI entry point — delegates to _compress with parsed argparse namespace.
+
+    Args:
+        args: argparse.Namespace with .input, .output, and optional .format.
+    """
     _compress(args.input, args.output, getattr(args, 'format', None))
 
 
 def _compress(input_path, output_path, fmt_name=None):
+    """Compress a log file into .logz format with seekable chunks and bloom filters.
+
+    Writes the .logz file in this order:
+      1. Header (magic, version, format byte, dict length, dict bytes)
+      2. Compressed 64 KB chunks back-to-back
+      3. Jump table (one entry per chunk: offset + sizes + bloom filter)
+      4. Footer (jump table offset + chunk count) — read first on open, like Parquet
+
+    Args:
+        input_path:  Path to the source log file.
+        output_path: Destination path for the .logz output file.
+        fmt_name:    Optional format override ('json', 'syslog', 'plaintext').
+                     Auto-detected from file content when None.
+    """
     fmt = FORMAT_BY_NAME[fmt_name] if fmt_name else detect_format(input_path)
 
     print("Training dictionary...", file=sys.stderr)
@@ -81,30 +137,34 @@ def _compress(input_path, output_path, fmt_name=None):
         compressor = zstd.ZstdCompressor(level=3)
 
     input_size = 0
-    jump_table = []  # (chunk_offset, comp_size, orig_size, bloom_bytes)
+    jump_table = []  # accumulates (chunk_offset, comp_size, orig_size, bloom_bytes)
 
     with open(input_path, 'rb') as fin, open(output_path, 'wb') as fout:
+        # --- Header ---
         fout.write(b'LOGZ')
         fout.write(struct.pack('<H', VERSION))
         fout.write(struct.pack('B', fmt))
         fout.write(struct.pack('<I', len(dict_data)))
         fout.write(dict_data)
 
+        # --- Chunks ---
         while True:
             raw = fin.read(CHUNK_SIZE)
             if not raw:
                 break
             input_size += len(raw)
             bf = bloom.build(raw)
-            chunk_offset = fout.tell()
+            chunk_offset = fout.tell()  # absolute byte offset stored in jump table
             comp = compressor.compress(raw)
             fout.write(comp)
             jump_table.append((chunk_offset, len(comp), len(raw), bf))
 
+        # --- Jump table ---
         jump_table_offset = fout.tell()
         for offset, comp_size, orig_size, bf in jump_table:
             fout.write(struct.pack('<QII', offset, comp_size, orig_size))
-            fout.write(bf)
+            fout.write(bf)  # 1024 bytes of bloom filter per chunk
+        # Footer: two fixed-width fields so a reader can bootstrap from EOF-12
         fout.write(struct.pack('<QI', jump_table_offset, len(jump_table)))
 
         output_size = fout.tell()

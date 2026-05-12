@@ -1,3 +1,5 @@
 venv/
 *.logz
 data/
+src/__pycache__/
+tests/__pycache__/
