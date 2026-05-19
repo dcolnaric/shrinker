@@ -1,5 +1,6 @@
 """Compress log files into the .logz seekable compressed format."""
 
+import hashlib
 import json
 import re
 import struct
@@ -12,7 +13,9 @@ CHUNK_SIZE = 64 * 1024   # 64 KB — SIMD-aligned for the future C rewrite
 DICT_SIZE = 112 * 1024   # zstd dictionary target size in bytes
 TRAIN_LIMIT = 10 * 1024 * 1024  # cap dictionary training at 10 MB so startup stays fast
 
-VERSION = 2  # v1 = no bloom filters, v2 = bloom in jump table
+VERSION = 2  # v1 = no bloom/hash, v2 = bloom + SHA-256 hash chain in jump table
+FOOTER_SIZE = 44        # chain_hash(32) + jt_offset(8) + num_chunks(4)
+JUMP_ENTRY_SIZE = 1072  # offset(8) + comp_size(4) + orig_size(4) + bloom(1024) + hash(32)
 
 FORMAT_JSON = 0
 FORMAT_SYSLOG = 1
@@ -137,7 +140,8 @@ def _compress(input_path, output_path, fmt_name=None):
         compressor = zstd.ZstdCompressor(level=3)
 
     input_size = 0
-    jump_table = []  # accumulates (chunk_offset, comp_size, orig_size, bloom_bytes)
+    jump_table = []  # accumulates (chunk_offset, comp_size, orig_size, bloom_bytes, chunk_hash)
+    prev_hash = None
 
     with open(input_path, 'rb') as fin, open(output_path, 'wb') as fout:
         # --- Header ---
@@ -154,17 +158,30 @@ def _compress(input_path, output_path, fmt_name=None):
                 break
             input_size += len(raw)
             bf = bloom.build(raw)
+
+            # Hash chain over raw bytes — chunk N = SHA256(prev_hash || raw)
+            h = hashlib.sha256()
+            if prev_hash is not None:
+                h.update(prev_hash)
+            h.update(raw)
+            chunk_hash = h.digest()
+            prev_hash = chunk_hash
+
             chunk_offset = fout.tell()  # absolute byte offset stored in jump table
             comp = compressor.compress(raw)
             fout.write(comp)
-            jump_table.append((chunk_offset, len(comp), len(raw), bf))
+            jump_table.append((chunk_offset, len(comp), len(raw), bf, chunk_hash))
 
         # --- Jump table ---
         jump_table_offset = fout.tell()
-        for offset, comp_size, orig_size, bf in jump_table:
+        for offset, comp_size, orig_size, bf, chunk_hash in jump_table:
             fout.write(struct.pack('<QII', offset, comp_size, orig_size))
-            fout.write(bf)  # 1024 bytes of bloom filter per chunk
-        # Footer: two fixed-width fields so a reader can bootstrap from EOF-12
+            fout.write(bf)          # 1024 bytes bloom filter
+            fout.write(chunk_hash)  # 32 bytes SHA-256 hash chain entry
+
+        # Footer: chain_hash(32) + jt_offset(8) + num_chunks(4) = 44 bytes
+        chain_hash = prev_hash if prev_hash is not None else b'\x00' * 32
+        fout.write(chain_hash)
         fout.write(struct.pack('<QI', jump_table_offset, len(jump_table)))
 
         output_size = fout.tell()

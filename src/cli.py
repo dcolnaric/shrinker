@@ -4,6 +4,7 @@ import sys
 import compress
 import decompress
 import search
+from verify import verify
 
 EXAMPLES = """
 examples:
@@ -13,6 +14,7 @@ examples:
   shrinker search server.logz "500"
   shrinker decompress archive.logz --output restored.log
   shrinker decompress archive.logz > restored.log
+  shrinker verify archive.logz
 """
 
 
@@ -38,6 +40,9 @@ def build_parser():
     d.add_argument('file', help='Input .logz file path')
     d.add_argument('--output', metavar='filename', help='Write output to file instead of stdout')
 
+    v = sub.add_parser('verify', help='Verify the SHA-256 hash chain of a .logz file')
+    v.add_argument('input', help='Input .logz file path')
+
     return parser
 
 
@@ -53,6 +58,9 @@ def main():
         search.run(args)
     elif args.command == 'decompress':
         decompress.run(args)
+    elif args.command == 'verify':
+        rc = verify(args.input)
+        sys.exit(rc)
 
 
 if __name__ == '__main__':

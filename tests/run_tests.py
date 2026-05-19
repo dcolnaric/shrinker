@@ -6,6 +6,7 @@ TESTS = [
     ('test_compress.py', 'Compress'),
     ('test_search.py', 'Search'),
     ('test_decompress.py', 'Decompress'),
+    ('test_verify.py', 'Verify'),
 ]
 
 passed = 0

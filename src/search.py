@@ -6,6 +6,9 @@ import zstandard as zstd
 
 import bloom
 
+FOOTER_SIZE = 44        # chain_hash(32) + jt_offset(8) + num_chunks(4)
+JUMP_ENTRY_SIZE = 1072  # offset(8) + comp_size(4) + orig_size(4) + bloom(1024) + hash(32)
+
 
 def run(args):
     """CLI entry point — delegates to _search with parsed argparse namespace.
@@ -33,15 +36,14 @@ def _search(logz_path, query):
     query_bytes = query.encode('utf-8')
 
     with open(logz_path, 'rb') as f:
-        # Footer is always the last 12 bytes — seek there first to find the jump table
-        f.seek(-12, 2)
-        jump_table_offset, num_chunks = struct.unpack('<QI', f.read(12))
-
-        # Version determines whether bloom filters are present in the jump table
+        # Read header fields in order
         f.seek(4)
         version = struct.unpack('<H', f.read(2))[0]
+        if version != 2:
+            print(f"error: unsupported version {version} (expected 2)", file=sys.stderr)
+            sys.exit(2)
 
-        # Load the shared dictionary; without it zstd cannot decompress v2 chunks
+        # Load the shared dictionary; without it zstd cannot decompress chunks
         f.seek(7)
         dict_len = struct.unpack('<I', f.read(4))[0]
         if dict_len > 0:
@@ -51,13 +53,18 @@ def _search(logz_path, query):
         else:
             decompressor = zstd.ZstdDecompressor()
 
-        # Read the full jump table into memory — it's small (1040 bytes per chunk)
+        # Footer is always the last 44 bytes — seek there first to find the jump table
+        f.seek(-FOOTER_SIZE, 2)
+        f.read(32)  # skip chain_hash (not needed for search)
+        jump_table_offset, num_chunks = struct.unpack('<QI', f.read(12))
+
+        # Read the full jump table into memory — it's small (1072 bytes per chunk)
         f.seek(jump_table_offset)
         jump_table = []
         for _ in range(num_chunks):
             offset, comp_size, orig_size = struct.unpack('<QII', f.read(16))
-            # v1 files have no bloom bytes; read them only when the version supports it
-            bf = f.read(bloom.BLOOM_BYTES) if version >= 2 else None
+            bf = f.read(bloom.BLOOM_BYTES)
+            f.read(32)  # skip stored chunk_hash
             jump_table.append((offset, comp_size, orig_size, bf))
 
         matches = 0

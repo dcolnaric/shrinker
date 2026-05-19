@@ -7,6 +7,8 @@ import zstandard as zstd
 import bloom
 
 MAGIC = b'LOGZ'
+FOOTER_SIZE = 44        # chain_hash(32) + jt_offset(8) + num_chunks(4)
+JUMP_ENTRY_SIZE = 1072  # offset(8) + comp_size(4) + orig_size(4) + bloom(1024) + hash(32)
 
 
 def run(args):
@@ -46,6 +48,9 @@ def _decompress(logz_path, fout):
             sys.exit(1)
 
         version = struct.unpack('<H', f.read(2))[0]
+        if version != 2:
+            print(f"error: unsupported version {version} (expected 2)", file=sys.stderr)
+            sys.exit(1)
         f.read(1)  # FORMAT byte — records original log type but not needed to decompress
 
         dict_len = struct.unpack('<I', f.read(4))[0]
@@ -56,16 +61,17 @@ def _decompress(logz_path, fout):
         else:
             decompressor = zstd.ZstdDecompressor()
 
-        # Footer is always 12 bytes at EOF — same bootstrap as search.py
-        f.seek(-12, 2)
+        # Footer is always 44 bytes at EOF — same bootstrap as search.py
+        f.seek(-FOOTER_SIZE, 2)
+        f.read(32)  # skip chain_hash (not needed for decompression)
         jump_table_offset, num_chunks = struct.unpack('<QI', f.read(12))
 
         f.seek(jump_table_offset)
         jump_table = []
         for _ in range(num_chunks):
             offset, comp_size, orig_size = struct.unpack('<QII', f.read(16))
-            if version >= 2:
-                f.read(bloom.BLOOM_BYTES)  # bloom bytes are not needed for full decompression
+            f.read(bloom.BLOOM_BYTES)  # bloom bytes not needed for full decompression
+            f.read(32)                 # chunk_hash not needed for full decompression
             jump_table.append((offset, comp_size, orig_size))
 
         output_size = 0

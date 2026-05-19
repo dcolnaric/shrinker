@@ -37,13 +37,15 @@ class TestCompress(unittest.TestCase):
 
     def _read_jump_table(self):
         with open(self.output_path, 'rb') as f:
-            f.seek(-12, 2)
+            f.seek(-compress.FOOTER_SIZE, 2)
+            f.read(32)  # skip chain_hash
             jump_table_offset, num_chunks = struct.unpack('<QI', f.read(12))
             f.seek(jump_table_offset)
             entries = []
             for _ in range(num_chunks):
                 offset, comp_size, orig_size = struct.unpack('<QII', f.read(16))
                 bf = f.read(bloom.BLOOM_BYTES)
+                f.read(32)  # skip chunk_hash
                 entries.append((offset, comp_size, orig_size, bf))
         return num_chunks, entries
 
