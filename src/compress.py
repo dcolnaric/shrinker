@@ -5,6 +5,7 @@ import json
 import re
 import struct
 import sys
+from datetime import datetime, timezone
 import zstandard as zstd
 
 import bloom
@@ -13,9 +14,9 @@ CHUNK_SIZE = 64 * 1024   # 64 KB — SIMD-aligned for the future C rewrite
 DICT_SIZE = 112 * 1024   # zstd dictionary target size in bytes
 TRAIN_LIMIT = 10 * 1024 * 1024  # cap dictionary training at 10 MB so startup stays fast
 
-VERSION = 2  # v1 = no bloom/hash, v2 = bloom + SHA-256 hash chain in jump table
+VERSION = 3  # v1 = no bloom/hash, v2 = bloom + SHA-256 hash chain, v3 = + min/max timestamps
 FOOTER_SIZE = 44        # chain_hash(32) + jt_offset(8) + num_chunks(4)
-JUMP_ENTRY_SIZE = 1072  # offset(8) + comp_size(4) + orig_size(4) + bloom(1024) + hash(32)
+JUMP_ENTRY_SIZE = 1088  # offset(8) + comp_size(4) + orig_size(4) + bloom(1024) + hash(32) + min_ts(8) + max_ts(8)
 
 FORMAT_JSON = 0
 FORMAT_SYSLOG = 1
@@ -24,6 +25,13 @@ FORMAT_NAMES = {FORMAT_JSON: 'json', FORMAT_SYSLOG: 'syslog', FORMAT_PLAINTEXT: 
 FORMAT_BY_NAME = {'json': FORMAT_JSON, 'syslog': FORMAT_SYSLOG, 'plaintext': FORMAT_PLAINTEXT}
 
 SYSLOG_RE = re.compile(r'^\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s')
+
+_SYSLOG_TS_RE = re.compile(rb'^(\w{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s')
+_SYSLOG_MONTHS = {
+    b'Jan': 1, b'Feb': 2, b'Mar': 3, b'Apr': 4, b'May': 5, b'Jun': 6,
+    b'Jul': 7, b'Aug': 8, b'Sep': 9, b'Oct': 10, b'Nov': 11, b'Dec': 12,
+}
+_JSON_TS_KEYS = ('timestamp', 'time', 'ts', '@timestamp')
 
 
 def detect_format(path):
@@ -71,6 +79,94 @@ def _try_json(line):
         return True
     except (json.JSONDecodeError, ValueError):
         return False
+
+
+def _parse_iso(s):
+    """Parse an ISO 8601 string to unix epoch seconds, or return None."""
+    s = s.strip()
+    if s.endswith('Z'):
+        s = s[:-1] + '+00:00'
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except (ValueError, OverflowError):
+        return None
+
+
+def _ts_from_json_line(line_bytes):
+    """Return a unix timestamp from a JSON log line, or None if not found."""
+    try:
+        obj = json.loads(line_bytes.decode('utf-8', errors='replace'))
+        for key in _JSON_TS_KEYS:
+            val = obj.get(key)
+            if val is None:
+                continue
+            if isinstance(val, (int, float)) and val > 0:
+                return int(val)
+            if isinstance(val, str):
+                ts = _parse_iso(val)
+                if ts is not None:
+                    return ts
+    except (json.JSONDecodeError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def _ts_from_syslog_line(line_bytes):
+    """Return a unix timestamp from a syslog-format line, or None if not found."""
+    m = _SYSLOG_TS_RE.match(line_bytes)
+    if not m:
+        return None
+    mon = _SYSLOG_MONTHS.get(m.group(1))
+    if not mon:
+        return None
+    day, hour, minute, sec = int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5))
+    year = datetime.now(timezone.utc).year
+    try:
+        dt = datetime(year, mon, day, hour, minute, sec, tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except ValueError:
+        return None
+
+
+def _ts_for_line(line_bytes, fmt):
+    """Dispatch timestamp extraction based on log format."""
+    if fmt == FORMAT_JSON:
+        return _ts_from_json_line(line_bytes)
+    if fmt == FORMAT_SYSLOG:
+        return _ts_from_syslog_line(line_bytes)
+    # Plaintext: try JSON first, then syslog
+    ts = _ts_from_json_line(line_bytes)
+    return ts if ts is not None else _ts_from_syslog_line(line_bytes)
+
+
+def _extract_timestamps(raw, fmt):
+    """Return (min_ts, max_ts) as unix epoch seconds for a raw chunk.
+
+    Scans forward for the first timestamp and backward for the last. Assumes
+    logs are in chronological order, which is true for virtually all log files.
+    Returns (0, 0) if no timestamps are found.
+    """
+    lines = raw.split(b'\n')
+    min_ts = None
+    max_ts = None
+    for line in lines:
+        if line:
+            ts = _ts_for_line(line, fmt)
+            if ts is not None:
+                min_ts = ts
+                break
+    for line in reversed(lines):
+        if line:
+            ts = _ts_for_line(line, fmt)
+            if ts is not None:
+                max_ts = ts
+                break
+    if min_ts is None or max_ts is None:
+        return 0, 0
+    return min_ts, max_ts
 
 
 def _train_dict(path):
@@ -140,7 +236,7 @@ def _compress(input_path, output_path, fmt_name=None):
         compressor = zstd.ZstdCompressor(level=3)
 
     input_size = 0
-    jump_table = []  # accumulates (chunk_offset, comp_size, orig_size, bloom_bytes, chunk_hash)
+    jump_table = []  # (chunk_offset, comp_size, orig_size, bloom_bytes, chunk_hash, min_ts, max_ts)
     prev_hash = None
 
     with open(input_path, 'rb') as fin, open(output_path, 'wb') as fout:
@@ -167,17 +263,19 @@ def _compress(input_path, output_path, fmt_name=None):
             chunk_hash = h.digest()
             prev_hash = chunk_hash
 
+            min_ts, max_ts = _extract_timestamps(raw, fmt)
             chunk_offset = fout.tell()  # absolute byte offset stored in jump table
             comp = compressor.compress(raw)
             fout.write(comp)
-            jump_table.append((chunk_offset, len(comp), len(raw), bf, chunk_hash))
+            jump_table.append((chunk_offset, len(comp), len(raw), bf, chunk_hash, min_ts, max_ts))
 
         # --- Jump table ---
         jump_table_offset = fout.tell()
-        for offset, comp_size, orig_size, bf, chunk_hash in jump_table:
+        for offset, comp_size, orig_size, bf, chunk_hash, min_ts, max_ts in jump_table:
             fout.write(struct.pack('<QII', offset, comp_size, orig_size))
             fout.write(bf)          # 1024 bytes bloom filter
             fout.write(chunk_hash)  # 32 bytes SHA-256 hash chain entry
+            fout.write(struct.pack('<QQ', min_ts, max_ts))  # 16 bytes timestamp range
 
         # Footer: chain_hash(32) + jt_offset(8) + num_chunks(4) = 44 bytes
         chain_hash = prev_hash if prev_hash is not None else b'\x00' * 32

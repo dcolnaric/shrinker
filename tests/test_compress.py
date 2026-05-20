@@ -46,6 +46,7 @@ class TestCompress(unittest.TestCase):
                 offset, comp_size, orig_size = struct.unpack('<QII', f.read(16))
                 bf = f.read(bloom.BLOOM_BYTES)
                 f.read(32)  # skip chunk_hash
+                f.read(16)  # skip min_ts + max_ts
                 entries.append((offset, comp_size, orig_size, bf))
         return num_chunks, entries
 

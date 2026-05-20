@@ -2,36 +2,56 @@
 
 import struct
 import sys
+from datetime import datetime, timezone
 import zstandard as zstd
 
 import bloom
 
 FOOTER_SIZE = 44        # chain_hash(32) + jt_offset(8) + num_chunks(4)
-JUMP_ENTRY_SIZE = 1072  # offset(8) + comp_size(4) + orig_size(4) + bloom(1024) + hash(32)
+JUMP_ENTRY_SIZE = 1088  # offset(8) + comp_size(4) + orig_size(4) + bloom(1024) + hash(32) + min_ts(8) + max_ts(8)
+
+
+def _date_to_ts(date_str, end_of_day=False):
+    """Parse a date string like '2025-01-01' to unix epoch seconds, or None on error."""
+    s = date_str.strip()
+    if s.endswith('Z'):
+        s = s[:-1] + '+00:00'
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if end_of_day and 'T' not in date_str and ' ' not in date_str:
+            dt = dt.replace(hour=23, minute=59, second=59)
+        return int(dt.timestamp())
+    except (ValueError, OverflowError):
+        return None
 
 
 def run(args):
     """CLI entry point — delegates to _search with parsed argparse namespace.
 
     Args:
-        args: argparse.Namespace with .file and .query.
+        args: argparse.Namespace with .file, .query, and optional .from_date/.to_date.
     """
-    _search(args.file, args.query)
+    from_ts = _date_to_ts(args.from_date) if getattr(args, 'from_date', None) else None
+    to_ts = _date_to_ts(args.to_date, end_of_day=True) if getattr(args, 'to_date', None) else None
+    _search(args.file, args.query, from_ts=from_ts, to_ts=to_ts)
 
 
-def _search(logz_path, query):
+def _search(logz_path, query, from_ts=None, to_ts=None):
     """Search a .logz file and print every line that contains the query string.
 
     Uses per-chunk bloom filters to skip chunks that cannot possibly contain the
-    query. Only chunks that pass the bloom check are decompressed — on a typical
-    UUID search this skips 95-99% of chunks.
+    query. When from_ts/to_ts are given, chunks whose timestamp range does not
+    overlap the requested window are skipped before the bloom check.
 
-    Matching lines are printed to stdout. A summary line (matches, chunks
-    scanned, chunks skipped) is printed to stderr.
+    Matching lines are printed to stdout. A summary line is printed to stderr.
 
     Args:
         logz_path: Path to the .logz compressed file.
         query:     Search string (UTF-8). Matched as a literal byte sequence.
+        from_ts:   Optional start of time window as unix epoch seconds (inclusive).
+        to_ts:     Optional end of time window as unix epoch seconds (inclusive).
     """
     query_bytes = query.encode('utf-8')
 
@@ -39,8 +59,8 @@ def _search(logz_path, query):
         # Read header fields in order
         f.seek(4)
         version = struct.unpack('<H', f.read(2))[0]
-        if version != 2:
-            print(f"error: unsupported version {version} (expected 2)", file=sys.stderr)
+        if version != 3:
+            print(f"error: unsupported version {version} (expected 3)", file=sys.stderr)
             sys.exit(2)
 
         # Load the shared dictionary; without it zstd cannot decompress chunks
@@ -58,20 +78,33 @@ def _search(logz_path, query):
         f.read(32)  # skip chain_hash (not needed for search)
         jump_table_offset, num_chunks = struct.unpack('<QI', f.read(12))
 
-        # Read the full jump table into memory — it's small (1072 bytes per chunk)
+        # Read the full jump table into memory — it's small (1088 bytes per chunk)
         f.seek(jump_table_offset)
         jump_table = []
         for _ in range(num_chunks):
             offset, comp_size, orig_size = struct.unpack('<QII', f.read(16))
             bf = f.read(bloom.BLOOM_BYTES)
             f.read(32)  # skip stored chunk_hash
-            jump_table.append((offset, comp_size, orig_size, bf))
+            min_ts, max_ts = struct.unpack('<QQ', f.read(16))
+            jump_table.append((offset, comp_size, orig_size, bf, min_ts, max_ts))
 
         matches = 0
         chunks_scanned = 0
         skipped_by_bloom = 0
+        skipped_by_time = 0
 
-        for offset, comp_size, orig_size, bf in jump_table:
+        for offset, comp_size, orig_size, bf, min_ts, max_ts in jump_table:
+            # Time-range skip: cheaper than bloom, so checked first
+            if from_ts is not None or to_ts is not None:
+                has_ts = (min_ts != 0 or max_ts != 0)
+                if has_ts:
+                    if from_ts is not None and max_ts < from_ts:
+                        skipped_by_time += 1
+                        continue
+                    if to_ts is not None and min_ts > to_ts:
+                        skipped_by_time += 1
+                        continue
+
             if bf is not None and not bloom.query_present(bf, query_bytes):
                 # Bloom filter guarantees no false negatives — safe to skip entirely
                 skipped_by_bloom += 1
@@ -90,6 +123,7 @@ def _search(logz_path, query):
                     matches += 1
 
     print(
-        f"Matches: {matches}  |  Chunks scanned: {chunks_scanned} / {num_chunks}  |  Skipped by bloom: {skipped_by_bloom}",
+        f"Matches: {matches}  |  Chunks scanned: {chunks_scanned} / {num_chunks}"
+        f"  |  Skipped by time: {skipped_by_time}  |  Skipped by bloom: {skipped_by_bloom}",
         file=sys.stderr,
     )
