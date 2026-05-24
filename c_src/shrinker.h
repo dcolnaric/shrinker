@@ -127,4 +127,8 @@ int verify_file(const char *logz_path);
 /* decompress.c — returns 0=success, 1=error */
 int decompress_file(const char *logz_path, const char *output_path);
 
+/* export.c — format is "csv" or "json"; returns 0=success, 1=error */
+int export_file(const char *logz_path, const char *from_date,
+                const char *to_date, const char *format);
+
 #endif /* SHRINKER_H */

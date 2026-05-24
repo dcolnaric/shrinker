@@ -8,6 +8,7 @@
  * Step 13: search  subcommand — delegates to search_file().
  * Step 14: verify     subcommand — delegates to verify_file().
  * Step 15: decompress subcommand — delegates to decompress_file().
+ * Step 16: export     subcommand — delegates to export_file().
  *
  * Usage:
  *   shrinker compress   <input> <output.logz>
@@ -15,6 +16,7 @@
  *                       [--user X] [--ip X] [--action X] [--level X]
  *   shrinker verify     <file.logz>
  *   shrinker decompress <file.logz> <output.log>
+ *   shrinker export     <file.logz> [--from DATE] [--to DATE] [--format csv|json]
  *   shrinker inspect    <file.logz>
  *
  * Exit codes:  0 = success
@@ -105,6 +107,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "                      [--user X] [--ip X] [--action X] [--level X]\n");
         fprintf(stderr, "  shrinker verify     <file.logz>\n");
         fprintf(stderr, "  shrinker decompress <file.logz> <output.log>\n");
+        fprintf(stderr, "  shrinker export     <file.logz> [--from DATE] [--to DATE] [--format csv|json]\n");
         fprintf(stderr, "  shrinker inspect    <file.logz>\n");
         return 1;
     }
@@ -183,6 +186,37 @@ int main(int argc, char *argv[])
             return 1;
         }
         int rc = decompress_file(argv[2], argv[3]);
+        return (rc == 0) ? 0 : 1;
+    }
+
+    /* -----------------------------------------------------------------------
+     * export subcommand
+     * Usage: shrinker export <file.logz> [--from DATE] [--to DATE]
+     *                        [--format csv|json]
+     * Writes output to stdout; redirect to a file in the shell.
+     * --------------------------------------------------------------------- */
+    if (strcmp(argv[1], "export") == 0) {
+        if (argc < 3) {
+            fprintf(stderr,
+                "usage: shrinker export <file.logz> [--from DATE] [--to DATE]"
+                " [--format csv|json]\n");
+            return 1;
+        }
+        const char *file      = argv[2];
+        const char *from_date = NULL;
+        const char *to_date   = NULL;
+        const char *format    = "csv";   /* default */
+
+        for (int i = 3; i < argc; i++) {
+            if      (strcmp(argv[i], "--from")   == 0 && i + 1 < argc) from_date = argv[++i];
+            else if (strcmp(argv[i], "--to")     == 0 && i + 1 < argc) to_date   = argv[++i];
+            else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) format    = argv[++i];
+            else {
+                fprintf(stderr, "export: unknown argument '%s'\n", argv[i]);
+                return 1;
+            }
+        }
+        int rc = export_file(file, from_date, to_date, format);
         return (rc == 0) ? 0 : 1;
     }
 
