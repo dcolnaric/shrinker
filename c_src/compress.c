@@ -78,7 +78,8 @@ static uint32_t bloom_djb2(const uint8_t *data, size_t len)
 {
     uint32_t h = 5381;
     for (size_t i = 0; i < len; i++)
-        h = ((h << 5) + h) ^ (uint32_t)data[i];   /* h*33 ^ c */
+        h = ((h << 5) + h) + (uint32_t)data[i];   /* h*33 + c  — standard djb2;
+                                                     * matches Python bloom.py _djb2 */
     return h;
 }
 

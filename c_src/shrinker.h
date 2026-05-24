@@ -115,4 +115,10 @@ _Static_assert(sizeof(FileFooter) == FOOTER_SIZE,
 /* compress.c */
 int compress_file(const char *input_path, const char *output_path);
 
+/* search.c */
+int search_file(const char *logz_path, const char *query,
+                const char *from_date, const char *to_date,
+                const char *field_user, const char *field_ip,
+                const char *field_action, const char *field_level);
+
 #endif /* SHRINKER_H */

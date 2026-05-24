@@ -1,13 +1,16 @@
 /*
- * main.c — Shrinker C prototype (Phase 3 Steps 10-12)
+ * main.c — Shrinker C CLI dispatcher (Phase 3 Steps 10-13)
  *
  * Step 10: validate header magic + version, read and print footer.
  * Step 11: read full jump table, print per-entry summaries, verify
  *          total decompressed size, cross-validate chunk-0 SHA-256.
  * Step 12: compress subcommand — delegates to compress_file().
+ * Step 13: search  subcommand — delegates to search_file().
  *
  * Usage:
  *   shrinker compress <input> <output.logz>
+ *   shrinker search   <file.logz> <query> [--from DATE] [--to DATE]
+ *                     [--user X] [--ip X] [--action X] [--level X]
  *   shrinker inspect  <file.logz>
  *
  * Exit codes:  0 = success
@@ -94,6 +97,8 @@ int main(int argc, char *argv[])
     if (argc < 2) {
         fprintf(stderr, "usage:\n");
         fprintf(stderr, "  shrinker compress <input> <output.logz>\n");
+        fprintf(stderr, "  shrinker search   <file.logz> <query> [--from DATE] [--to DATE]\n");
+        fprintf(stderr, "                    [--user X] [--ip X] [--action X] [--level X]\n");
         fprintf(stderr, "  shrinker inspect  <file.logz>\n");
         return 1;
     }
@@ -107,6 +112,45 @@ int main(int argc, char *argv[])
             return 1;
         }
         int rc = compress_file(argv[2], argv[3]);
+        return (rc == 0) ? 0 : 1;
+    }
+
+    /* -----------------------------------------------------------------------
+     * search subcommand
+     * Usage: shrinker search <file> <query> [--from DATE] [--to DATE]
+     *                        [--user X] [--ip X] [--action X] [--level X]
+     * --------------------------------------------------------------------- */
+    if (strcmp(argv[1], "search") == 0) {
+        if (argc < 4) {
+            fprintf(stderr,
+                "usage: shrinker search <file> <query> [--from DATE] [--to DATE]\n"
+                "                       [--user X] [--ip X] [--action X] [--level X]\n");
+            return 1;
+        }
+        const char *file  = argv[2];
+        const char *query = argv[3];
+        const char *from_date    = NULL;
+        const char *to_date      = NULL;
+        const char *field_user   = NULL;
+        const char *field_ip     = NULL;
+        const char *field_action = NULL;
+        const char *field_level  = NULL;
+
+        for (int i = 4; i < argc; i++) {
+            if      (strcmp(argv[i], "--from")   == 0 && i + 1 < argc) from_date    = argv[++i];
+            else if (strcmp(argv[i], "--to")     == 0 && i + 1 < argc) to_date      = argv[++i];
+            else if (strcmp(argv[i], "--user")   == 0 && i + 1 < argc) field_user   = argv[++i];
+            else if (strcmp(argv[i], "--ip")     == 0 && i + 1 < argc) field_ip     = argv[++i];
+            else if (strcmp(argv[i], "--action") == 0 && i + 1 < argc) field_action = argv[++i];
+            else if (strcmp(argv[i], "--level")  == 0 && i + 1 < argc) field_level  = argv[++i];
+            else {
+                fprintf(stderr, "search: unknown argument '%s'\n", argv[i]);
+                return 1;
+            }
+        }
+        int rc = search_file(file, query,
+                             from_date, to_date,
+                             field_user, field_ip, field_action, field_level);
         return (rc == 0) ? 0 : 1;
     }
 
