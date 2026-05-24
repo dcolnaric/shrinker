@@ -9,6 +9,7 @@ TESTS = [
     ('test_verify.py', 'Verify'),
     ('test_timerange.py', 'TimeRange'),
     ('test_field_search.py', 'FieldSearch'),
+    ('test_export.py', 'Export'),
 ]
 
 passed = 0

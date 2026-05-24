@@ -3,6 +3,7 @@ import sys
 
 import compress
 import decompress
+import export
 import search
 from verify import verify
 
@@ -15,6 +16,8 @@ examples:
   shrinker decompress archive.logz --output restored.log
   shrinker decompress archive.logz > restored.log
   shrinker verify archive.logz
+  shrinker export archive.logz --from 2025-01-01 --to 2025-01-31 > audit.csv
+  shrinker export archive.logz --format json > audit.jsonl
 """
 
 
@@ -55,6 +58,15 @@ def build_parser():
     v = sub.add_parser('verify', help='Verify the SHA-256 hash chain of a .logz file')
     v.add_argument('input', help='Input .logz file path')
 
+    e = sub.add_parser('export', help='Export log records to CSV or JSONL without full decompression')
+    e.add_argument('input', help='Input .logz file path')
+    e.add_argument('--from', dest='from_date', metavar='DATE',
+                   help='Start of time range (ISO date, e.g. 2025-01-01)')
+    e.add_argument('--to', dest='to_date', metavar='DATE',
+                   help='End of time range (ISO date, e.g. 2025-01-31)')
+    e.add_argument('--format', dest='format', choices=['csv', 'json'], default='csv',
+                   help='Output format: csv (default) or json (JSONL)')
+
     return parser
 
 
@@ -73,6 +85,8 @@ def main():
     elif args.command == 'verify':
         rc = verify(args.input)
         sys.exit(rc)
+    elif args.command == 'export':
+        export.run(args)
 
 
 if __name__ == '__main__':
