@@ -124,4 +124,7 @@ int search_file(const char *logz_path, const char *query,
 /* verify.c — returns 0=verified, 1=tampered, 2=error */
 int verify_file(const char *logz_path);
 
+/* decompress.c — returns 0=success, 1=error */
+int decompress_file(const char *logz_path, const char *output_path);
+
 #endif /* SHRINKER_H */

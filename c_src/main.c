@@ -6,14 +6,16 @@
  *          total decompressed size, cross-validate chunk-0 SHA-256.
  * Step 12: compress subcommand — delegates to compress_file().
  * Step 13: search  subcommand — delegates to search_file().
- * Step 14: verify  subcommand — delegates to verify_file().
+ * Step 14: verify     subcommand — delegates to verify_file().
+ * Step 15: decompress subcommand — delegates to decompress_file().
  *
  * Usage:
- *   shrinker compress <input> <output.logz>
- *   shrinker search   <file.logz> <query> [--from DATE] [--to DATE]
- *                     [--user X] [--ip X] [--action X] [--level X]
- *   shrinker verify   <file.logz>
- *   shrinker inspect  <file.logz>
+ *   shrinker compress   <input> <output.logz>
+ *   shrinker search     <file.logz> <query> [--from DATE] [--to DATE]
+ *                       [--user X] [--ip X] [--action X] [--level X]
+ *   shrinker verify     <file.logz>
+ *   shrinker decompress <file.logz> <output.log>
+ *   shrinker inspect    <file.logz>
  *
  * Exit codes:  0 = success
  *              1 = any error (bad args, I/O failure, wrong magic/version)
@@ -98,11 +100,12 @@ int main(int argc, char *argv[])
 {
     if (argc < 2) {
         fprintf(stderr, "usage:\n");
-        fprintf(stderr, "  shrinker compress <input> <output.logz>\n");
-        fprintf(stderr, "  shrinker search   <file.logz> <query> [--from DATE] [--to DATE]\n");
-        fprintf(stderr, "                    [--user X] [--ip X] [--action X] [--level X]\n");
-        fprintf(stderr, "  shrinker verify   <file.logz>\n");
-        fprintf(stderr, "  shrinker inspect  <file.logz>\n");
+        fprintf(stderr, "  shrinker compress   <input> <output.logz>\n");
+        fprintf(stderr, "  shrinker search     <file.logz> <query> [--from DATE] [--to DATE]\n");
+        fprintf(stderr, "                      [--user X] [--ip X] [--action X] [--level X]\n");
+        fprintf(stderr, "  shrinker verify     <file.logz>\n");
+        fprintf(stderr, "  shrinker decompress <file.logz> <output.log>\n");
+        fprintf(stderr, "  shrinker inspect    <file.logz>\n");
         return 1;
     }
 
@@ -168,6 +171,19 @@ int main(int argc, char *argv[])
             return 2;
         }
         return verify_file(argv[2]);
+    }
+
+    /* -----------------------------------------------------------------------
+     * decompress subcommand
+     * Usage: shrinker decompress <file.logz> <output.log>
+     * --------------------------------------------------------------------- */
+    if (strcmp(argv[1], "decompress") == 0) {
+        if (argc < 4) {
+            fprintf(stderr, "usage: shrinker decompress <file.logz> <output.log>\n");
+            return 1;
+        }
+        int rc = decompress_file(argv[2], argv[3]);
+        return (rc == 0) ? 0 : 1;
     }
 
     /* -----------------------------------------------------------------------

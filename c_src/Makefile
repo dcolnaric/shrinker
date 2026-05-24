@@ -4,7 +4,7 @@ CFLAGS_DEBUG   = $(CFLAGS_COMMON) -g -O0 -fsanitize=address
 CFLAGS_RELEASE = $(CFLAGS_COMMON) -O3 -DNDEBUG
 LIBS    = -lzstd -lssl -lcrypto -lm
 TARGET  = shrinker
-SRCS    = main.c compress.c search.c verify.c
+SRCS    = main.c compress.c search.c verify.c decompress.c
 
 # Default target is debug
 debug: $(SRCS) shrinker.h
