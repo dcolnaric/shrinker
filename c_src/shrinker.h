@@ -121,4 +121,7 @@ int search_file(const char *logz_path, const char *query,
                 const char *field_user, const char *field_ip,
                 const char *field_action, const char *field_level);
 
+/* verify.c — returns 0=verified, 1=tampered, 2=error */
+int verify_file(const char *logz_path);
+
 #endif /* SHRINKER_H */

@@ -6,11 +6,13 @@
  *          total decompressed size, cross-validate chunk-0 SHA-256.
  * Step 12: compress subcommand — delegates to compress_file().
  * Step 13: search  subcommand — delegates to search_file().
+ * Step 14: verify  subcommand — delegates to verify_file().
  *
  * Usage:
  *   shrinker compress <input> <output.logz>
  *   shrinker search   <file.logz> <query> [--from DATE] [--to DATE]
  *                     [--user X] [--ip X] [--action X] [--level X]
+ *   shrinker verify   <file.logz>
  *   shrinker inspect  <file.logz>
  *
  * Exit codes:  0 = success
@@ -99,6 +101,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "  shrinker compress <input> <output.logz>\n");
         fprintf(stderr, "  shrinker search   <file.logz> <query> [--from DATE] [--to DATE]\n");
         fprintf(stderr, "                    [--user X] [--ip X] [--action X] [--level X]\n");
+        fprintf(stderr, "  shrinker verify   <file.logz>\n");
         fprintf(stderr, "  shrinker inspect  <file.logz>\n");
         return 1;
     }
@@ -152,6 +155,19 @@ int main(int argc, char *argv[])
                              from_date, to_date,
                              field_user, field_ip, field_action, field_level);
         return (rc == 0) ? 0 : 1;
+    }
+
+    /* -----------------------------------------------------------------------
+     * verify subcommand
+     * Usage: shrinker verify <file.logz>
+     * Exit code mirrors verify_file(): 0=verified, 1=tampered, 2=error.
+     * --------------------------------------------------------------------- */
+    if (strcmp(argv[1], "verify") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "usage: shrinker verify <file.logz>\n");
+            return 2;
+        }
+        return verify_file(argv[2]);
     }
 
     /* -----------------------------------------------------------------------
