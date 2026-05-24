@@ -189,7 +189,7 @@ provides a dated, reproducible integrity attestation. The chain hash is determin
 
 ```bash
 # Python prototype (current)
-git clone https://github.com/slashdash123/shrinker
+git clone https://github.com/dcolnaric/shrinker
 cd shrinker
 python -m venv venv && source venv/bin/activate
 pip install zstandard
@@ -260,7 +260,7 @@ Thesis title: *"Design and implementation of an efficient format for log file ar
 
 ## Contact
 
-Domen Colnaric - software engineer  
+Domen Colnaric - software engineer
 domen.colnaric@gmail.com
 
 ---
