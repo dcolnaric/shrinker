@@ -27,16 +27,16 @@ shrinker export output.logz --from 2025-01-01 --format csv > audit.csv
 - Jump table overhead: 5.5% (target: below 5% — tune later)
 - Bloom filter skip rate: 98.8% chunks skipped on 1.5GB file (0 false positives)
 
-## .logz File Format (v3 — CURRENT):
+## .logz File Format (v4 — CURRENT):
 [MAGIC: 4 bytes: 0x4C4F475A "LOGZ"]
-[VERSION: 2 bytes, little-endian] — value 3
+[VERSION: 2 bytes, little-endian] — value 4
 [FORMAT: 1 byte] — 0=json, 1=syslog, 2=plaintext
 [DICT_LEN: 4 bytes, little-endian]
 [DICT_DATA: DICT_LEN bytes - shared zstd dictionary trained on first 10MB]
 [CHUNK_0..N: 64KB compressed blocks]
 
-Jump table — JUMP_ENTRY_SIZE = 1088 bytes per entry:
-  offset(8) + comp_size(4) + orig_size(4) + bloom(1024) + chunk_hash(32) + min_ts(8) + max_ts(8)
+Jump table — JUMP_ENTRY_SIZE = 1600 bytes per entry:
+  offset(8) + comp_size(4) + orig_size(4) + bloom(1024) + chunk_hash(32) + min_ts(8) + max_ts(8) + field_bloom(512)
 
 chunk_hash is SHA-256:
   chunk 0:  SHA256(raw_bytes)
@@ -47,12 +47,17 @@ min_ts / max_ts: unix epoch seconds (uint64 LE) of first/last timestamped line i
   Timestamp extraction supports: JSON keys (timestamp/time/ts/@timestamp),
   ISO 8601 strings, unix epoch ints/floats, syslog "Jan 15 10:23:45" prefix.
 
+field_bloom: 512-byte bloom filter (4096 bits, 3 hashes) indexing values of these JSON fields:
+  user, user_id, username, ip, ip_address, action, level, severity
+  Stored as 512 zero bytes for non-JSON formats (signals "no field index" to search).
+  Checked before the main bloom when --user/--ip/--action/--level flags are given.
+
 Footer — FOOTER_SIZE = 44 bytes, bootstrapped via seek(-44, EOF):
   [CHAIN_HASH: 32 bytes] — SHA256 of final chunk (convenience copy of last hash)
   [JUMP_TABLE_OFFSET: 8 bytes, little-endian]
   [NUM_CHUNKS: 4 bytes, little-endian]
 
-IMPORTANT: v1 and v2 files are rejected with a clear error. Do not add backward compatibility.
+IMPORTANT: v1, v2, and v3 files are rejected with a clear error. Do not add backward compatibility.
 IMPORTANT: Hash chain runs over RAW (pre-compression) bytes, not compressed bytes.
 IMPORTANT: Decompression failure on a chunk is treated as TAMPERED (exit 1), not error (exit 2).
 
@@ -67,7 +72,15 @@ Step 3 DONE: time-range search (--from / --to flags, min/max timestamp per chunk
   - Time-range skip happens before bloom filter check (cheaper first)
   - search stats line now includes "Skipped by time: N"
   - 5 tests in tests/test_timerange.py, all passing
-Next: Step 4 — field-filter search (--user / --ip / --level flags, JSON field matching).
+Step 4 DONE: field-filter search (--user / --ip / --action / --level flags, JSON field matching).
+  - Format bumped to v4; JUMP_ENTRY_SIZE = 1600 (added field_bloom, 512 bytes per chunk)
+  - field_bloom indexes values of: user, user_id, username, ip, ip_address, action, level, severity
+  - Non-JSON formats store 512 zero bytes → search falls back to full scan automatically
+  - Skip order: time → field bloom → main bloom (cheapest first)
+  - search stats line now includes "Skipped by field: N"
+  - AND logic: chunk skipped if ANY requested field value is definitely absent
+  - 6 tests in tests/test_field_search.py, all passing
+Next: Step 5 — export command (shrinker export output.logz --from 2025-01-01 --format csv).
 
 ## Strategic pivot (confirmed — do not second-guess):
 ORIGINAL: DevOps cold storage cost savings tool
@@ -99,6 +112,7 @@ shrinker/
     test_verify.py      # clean=0, VERIFIED output, tamper chunk0, tamper chunk1,
                         # exit code 1, zeroed hash caught, footer==last hash
     test_timerange.py   # timestamps in jump table, day-range skip, before/after/no-filter
+    test_field_search.py # field bloom in jump table, --user/--ip/--action filters, AND logic, plaintext fallback
     run_tests.py        # runs all suites, prints PASS/FAIL, exits 1 on failure
   README.md        # benchmarks, usage, file format, project status
   CLAUDE.md        # this file
