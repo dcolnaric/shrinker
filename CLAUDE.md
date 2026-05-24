@@ -11,11 +11,11 @@ Searchable without rehydration. Single binary."
 ## Commands (current):
 shrinker compress  server.log output.logz
 shrinker search    output.logz "payment failed"
+shrinker search    output.logz "payment failed" --from 2025-01-01 --to 2025-01-31
 shrinker decompress output.logz --output restored.log
 shrinker verify    output.logz        # Phase 2 — tamper detection
 
 ## Commands (planned Phase 2):
-shrinker search output.logz "admin" --from 2025-01-01 --to 2025-01-31
 shrinker search output.logz --user admin --ip 192.168.1.1
 shrinker export output.logz --from 2025-01-01 --format csv > audit.csv
 
@@ -27,27 +27,32 @@ shrinker export output.logz --from 2025-01-01 --format csv > audit.csv
 - Jump table overhead: 5.5% (target: below 5% — tune later)
 - Bloom filter skip rate: 98.8% chunks skipped on 1.5GB file (0 false positives)
 
-## .logz File Format (v2 — CURRENT):
+## .logz File Format (v3 — CURRENT):
 [MAGIC: 4 bytes: 0x4C4F475A "LOGZ"]
-[VERSION: 2 bytes, little-endian] — value 2
+[VERSION: 2 bytes, little-endian] — value 3
 [FORMAT: 1 byte] — 0=json, 1=syslog, 2=plaintext
 [DICT_LEN: 4 bytes, little-endian]
 [DICT_DATA: DICT_LEN bytes - shared zstd dictionary trained on first 10MB]
 [CHUNK_0..N: 64KB compressed blocks]
 
-Jump table — JUMP_ENTRY_SIZE = 1072 bytes per entry:
-  offset(8) + comp_size(4) + orig_size(4) + bloom(1024) + chunk_hash(32)
+Jump table — JUMP_ENTRY_SIZE = 1088 bytes per entry:
+  offset(8) + comp_size(4) + orig_size(4) + bloom(1024) + chunk_hash(32) + min_ts(8) + max_ts(8)
 
 chunk_hash is SHA-256:
   chunk 0:  SHA256(raw_bytes)
   chunk N:  SHA256(prev_chunk_hash || raw_bytes)
+
+min_ts / max_ts: unix epoch seconds (uint64 LE) of first/last timestamped line in chunk.
+  Stored as 0/0 when no timestamps are found in the chunk.
+  Timestamp extraction supports: JSON keys (timestamp/time/ts/@timestamp),
+  ISO 8601 strings, unix epoch ints/floats, syslog "Jan 15 10:23:45" prefix.
 
 Footer — FOOTER_SIZE = 44 bytes, bootstrapped via seek(-44, EOF):
   [CHAIN_HASH: 32 bytes] — SHA256 of final chunk (convenience copy of last hash)
   [JUMP_TABLE_OFFSET: 8 bytes, little-endian]
   [NUM_CHUNKS: 4 bytes, little-endian]
 
-IMPORTANT: v1 files are rejected with a clear error. Do not add v1 compatibility.
+IMPORTANT: v1 and v2 files are rejected with a clear error. Do not add backward compatibility.
 IMPORTANT: Hash chain runs over RAW (pre-compression) bytes, not compressed bytes.
 IMPORTANT: Decompression failure on a chunk is treated as TAMPERED (exit 1), not error (exit 2).
 
@@ -57,7 +62,12 @@ Steps 1-2 DONE: SHA-256 hash chain in compress.py, verify command in verify.py +
   - FOOTER_SIZE and JUMP_ENTRY_SIZE constants exported from each reader module
   - verify exit codes: 0=clean, 1=tampered (incl. decompression failure), 2=error
   - 7 tests in tests/test_verify.py, all passing
-Next: Step 3 — time-range search (--from / --to flags, min/max timestamp in jump table).
+Step 3 DONE: time-range search (--from / --to flags, min/max timestamp per chunk in jump table).
+  - Format bumped to v3; JUMP_ENTRY_SIZE = 1088 (added min_ts + max_ts, 8 bytes each)
+  - Time-range skip happens before bloom filter check (cheaper first)
+  - search stats line now includes "Skipped by time: N"
+  - 5 tests in tests/test_timerange.py, all passing
+Next: Step 4 — field-filter search (--user / --ip / --level flags, JSON field matching).
 
 ## Strategic pivot (confirmed — do not second-guess):
 ORIGINAL: DevOps cold storage cost savings tool
@@ -83,12 +93,13 @@ shrinker/
     bloom.py       # 1024-byte bloom filter: djb2 + fnv1a + sdbm hash functions
     cli.py         # argparse: compress / search / decompress / verify subcommands
   tests/
-    test_compress.py   # magic, ratio, chunk count, bloom data presence
-    test_search.py     # exact match, absent term, bloom skip count
-    test_decompress.py # byte-exact round-trip via diff + size check
-    test_verify.py     # clean=0, VERIFIED output, tamper chunk0, tamper chunk1,
-                       # exit code 1, zeroed hash caught, footer==last hash
-    run_tests.py       # runs all suites, prints PASS/FAIL, exits 1 on failure
+    test_compress.py    # magic, ratio, chunk count, bloom data presence
+    test_search.py      # exact match, absent term, bloom skip count
+    test_decompress.py  # byte-exact round-trip via diff + size check
+    test_verify.py      # clean=0, VERIFIED output, tamper chunk0, tamper chunk1,
+                        # exit code 1, zeroed hash caught, footer==last hash
+    test_timerange.py   # timestamps in jump table, day-range skip, before/after/no-filter
+    run_tests.py        # runs all suites, prints PASS/FAIL, exits 1 on failure
   README.md        # benchmarks, usage, file format, project status
   CLAUDE.md        # this file
   data/            # gitignored - put test log files here

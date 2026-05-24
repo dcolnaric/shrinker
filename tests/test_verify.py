@@ -49,9 +49,10 @@ def _read_jump_table(logz_path):
         entries = []
         for _ in range(num_chunks):
             offset, comp_size, orig_size = struct.unpack('<QII', f.read(16))
-            f.read(bloom.BLOOM_BYTES)  # skip bloom
+            f.read(bloom.BLOOM_BYTES)        # skip bloom
             stored_hash = f.read(32)
-            f.read(16)                 # skip min_ts + max_ts
+            f.read(16)                       # skip min_ts + max_ts
+            f.read(bloom.FIELD_BLOOM_BYTES)  # skip field bloom
             entries.append((offset, comp_size, orig_size, stored_hash))
     return entries, footer_chain_hash, jt_offset
 

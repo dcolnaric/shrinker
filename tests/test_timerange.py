@@ -85,6 +85,7 @@ class TestTimeRange(unittest.TestCase):
                 f.read(bloom.BLOOM_BYTES)
                 f.read(32)              # hash
                 min_ts, max_ts = struct.unpack('<QQ', f.read(16))
+                f.read(bloom.FIELD_BLOOM_BYTES)  # field bloom (v4)
                 if min_ts > 0 and max_ts > 0:
                     has_timestamps = True
                     break

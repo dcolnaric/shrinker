@@ -8,7 +8,7 @@ import bloom
 
 MAGIC = b'LOGZ'
 FOOTER_SIZE = 44        # chain_hash(32) + jt_offset(8) + num_chunks(4)
-JUMP_ENTRY_SIZE = 1088  # offset(8) + comp_size(4) + orig_size(4) + bloom(1024) + hash(32) + min_ts(8) + max_ts(8)
+JUMP_ENTRY_SIZE = 1600  # offset(8) + comp_size(4) + orig_size(4) + bloom(1024) + hash(32) + min_ts(8) + max_ts(8) + field_bloom(512)
 
 
 def run(args):
@@ -48,8 +48,8 @@ def _decompress(logz_path, fout):
             sys.exit(1)
 
         version = struct.unpack('<H', f.read(2))[0]
-        if version != 3:
-            print(f"error: unsupported version {version} (expected 3)", file=sys.stderr)
+        if version != 4:
+            print(f"error: unsupported version {version} (expected 4)", file=sys.stderr)
             sys.exit(1)
         f.read(1)  # FORMAT byte — records original log type but not needed to decompress
 
@@ -70,9 +70,10 @@ def _decompress(logz_path, fout):
         jump_table = []
         for _ in range(num_chunks):
             offset, comp_size, orig_size = struct.unpack('<QII', f.read(16))
-            f.read(bloom.BLOOM_BYTES)  # bloom bytes not needed for full decompression
-            f.read(32)                 # chunk_hash not needed for full decompression
-            f.read(16)                 # min_ts + max_ts not needed for full decompression
+            f.read(bloom.BLOOM_BYTES)        # bloom bytes not needed for full decompression
+            f.read(32)                       # chunk_hash not needed for full decompression
+            f.read(16)                       # min_ts + max_ts not needed for full decompression
+            f.read(bloom.FIELD_BLOOM_BYTES)  # field bloom not needed for full decompression
             jump_table.append((offset, comp_size, orig_size))
 
         output_size = 0

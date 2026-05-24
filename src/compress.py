@@ -14,9 +14,9 @@ CHUNK_SIZE = 64 * 1024   # 64 KB — SIMD-aligned for the future C rewrite
 DICT_SIZE = 112 * 1024   # zstd dictionary target size in bytes
 TRAIN_LIMIT = 10 * 1024 * 1024  # cap dictionary training at 10 MB so startup stays fast
 
-VERSION = 3  # v1 = no bloom/hash, v2 = bloom + SHA-256 hash chain, v3 = + min/max timestamps
+VERSION = 4  # v1 = no bloom/hash, v2 = bloom + SHA-256 hash chain, v3 = + timestamps, v4 = + field bloom
 FOOTER_SIZE = 44        # chain_hash(32) + jt_offset(8) + num_chunks(4)
-JUMP_ENTRY_SIZE = 1088  # offset(8) + comp_size(4) + orig_size(4) + bloom(1024) + hash(32) + min_ts(8) + max_ts(8)
+JUMP_ENTRY_SIZE = 1600  # offset(8) + comp_size(4) + orig_size(4) + bloom(1024) + hash(32) + min_ts(8) + max_ts(8) + field_bloom(512)
 
 FORMAT_JSON = 0
 FORMAT_SYSLOG = 1
@@ -32,6 +32,10 @@ _SYSLOG_MONTHS = {
     b'Jul': 7, b'Aug': 8, b'Sep': 9, b'Oct': 10, b'Nov': 11, b'Dec': 12,
 }
 _JSON_TS_KEYS = ('timestamp', 'time', 'ts', '@timestamp')
+
+# JSON field keys whose values are indexed in the per-chunk field bloom filter.
+# Only these fields are extracted; all other JSON content goes to the main bloom.
+_FIELD_KEYS = ('user', 'user_id', 'username', 'ip', 'ip_address', 'action', 'level', 'severity')
 
 
 def detect_format(path):
@@ -169,6 +173,38 @@ def _extract_timestamps(raw, fmt):
     return min_ts, max_ts
 
 
+def _extract_field_values(raw, fmt):
+    """Return a list of UTF-8 byte strings for structured fields in a raw chunk.
+
+    Only JSON-format logs are processed; syslog and plaintext produce an empty
+    list, which causes the field bloom to be stored as all-zero bytes.  Callers
+    in search.py treat an all-zero field bloom as "no field index available" and
+    fall back to a full scan when field filters are requested.
+
+    Args:
+        raw: Raw (pre-compression) chunk bytes.
+        fmt: One of FORMAT_JSON, FORMAT_SYSLOG, FORMAT_PLAINTEXT.
+
+    Returns:
+        List of byte strings (field values). May be empty.
+    """
+    if fmt != FORMAT_JSON:
+        return []
+    values = []
+    for line in raw.split(b'\n'):
+        if not line:
+            continue
+        try:
+            obj = json.loads(line.decode('utf-8', errors='replace'))
+            for key in _FIELD_KEYS:
+                val = obj.get(key)
+                if val is not None:
+                    values.append(str(val).encode('utf-8'))
+        except (json.JSONDecodeError, ValueError, AttributeError):
+            continue
+    return values
+
+
 def _train_dict(path):
     """Train a zstd shared dictionary on the first TRAIN_LIMIT bytes of a file.
 
@@ -236,7 +272,7 @@ def _compress(input_path, output_path, fmt_name=None):
         compressor = zstd.ZstdCompressor(level=3)
 
     input_size = 0
-    jump_table = []  # (chunk_offset, comp_size, orig_size, bloom_bytes, chunk_hash, min_ts, max_ts)
+    jump_table = []  # (chunk_offset, comp_size, orig_size, bloom_bytes, chunk_hash, min_ts, max_ts, field_bf)
     prev_hash = None
 
     with open(input_path, 'rb') as fin, open(output_path, 'wb') as fout:
@@ -264,18 +300,20 @@ def _compress(input_path, output_path, fmt_name=None):
             prev_hash = chunk_hash
 
             min_ts, max_ts = _extract_timestamps(raw, fmt)
+            field_bf = bloom.build_field(_extract_field_values(raw, fmt))
             chunk_offset = fout.tell()  # absolute byte offset stored in jump table
             comp = compressor.compress(raw)
             fout.write(comp)
-            jump_table.append((chunk_offset, len(comp), len(raw), bf, chunk_hash, min_ts, max_ts))
+            jump_table.append((chunk_offset, len(comp), len(raw), bf, chunk_hash, min_ts, max_ts, field_bf))
 
         # --- Jump table ---
         jump_table_offset = fout.tell()
-        for offset, comp_size, orig_size, bf, chunk_hash, min_ts, max_ts in jump_table:
+        for offset, comp_size, orig_size, bf, chunk_hash, min_ts, max_ts, field_bf in jump_table:
             fout.write(struct.pack('<QII', offset, comp_size, orig_size))
-            fout.write(bf)          # 1024 bytes bloom filter
+            fout.write(bf)          # 1024 bytes main bloom filter
             fout.write(chunk_hash)  # 32 bytes SHA-256 hash chain entry
             fout.write(struct.pack('<QQ', min_ts, max_ts))  # 16 bytes timestamp range
+            fout.write(field_bf)    # 512 bytes field-value bloom filter
 
         # Footer: chain_hash(32) + jt_offset(8) + num_chunks(4) = 44 bytes
         chain_hash = prev_hash if prev_hash is not None else b'\x00' * 32

@@ -7,6 +7,8 @@ TESTS = [
     ('test_search.py', 'Search'),
     ('test_decompress.py', 'Decompress'),
     ('test_verify.py', 'Verify'),
+    ('test_timerange.py', 'TimeRange'),
+    ('test_field_search.py', 'FieldSearch'),
 ]
 
 passed = 0

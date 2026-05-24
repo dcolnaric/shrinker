@@ -39,6 +39,14 @@ def build_parser():
                    help='Start of time range (ISO date, e.g. 2025-01-01)')
     s.add_argument('--to', dest='to_date', metavar='DATE',
                    help='End of time range (ISO date, e.g. 2025-01-31)')
+    s.add_argument('--user', metavar='VALUE',
+                   help='Filter by user/user_id/username field value (JSON logs only)')
+    s.add_argument('--ip', metavar='VALUE',
+                   help='Filter by ip/ip_address field value (JSON logs only)')
+    s.add_argument('--action', metavar='VALUE',
+                   help='Filter by action field value (JSON logs only)')
+    s.add_argument('--level', metavar='VALUE',
+                   help='Filter by level/severity field value (JSON logs only)')
 
     d = sub.add_parser('decompress', help='Decompress a .logz file back to original bytes')
     d.add_argument('file', help='Input .logz file path')
