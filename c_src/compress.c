@@ -11,7 +11,7 @@
  *              diff data/nginx.log restored.log
  */
 
-#define _GNU_SOURCE   /* for timegm() */
+#define _GNU_SOURCE   /* expose timegm() in <time.h> (POSIX extension, not C99) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,7 +27,11 @@
 #include "shrinker.h"
 
 /* -------------------------------------------------------------------------
- * Little-endian write helpers
+ * Little-endian write helpers.
+ * Writing byte-by-byte is correct on both LE and BE hosts; a direct
+ * fwrite(&v) would be wrong on big-endian machines (the .logz format
+ * mandates little-endian throughout).  Mirror of the read_u*_le helpers
+ * in main.c.
  * ------------------------------------------------------------------------- */
 
 static void write_u16_le(FILE *f, uint16_t v)
@@ -94,15 +98,19 @@ static uint32_t bloom_sdbm(const uint8_t *data, size_t len)
     return h;
 }
 
-/* Set one token in a bloom filter of `bits` bits (filter has bits/8 bytes). */
+/* Set one token in a bloom filter of `bits` bits (filter has bits/8 bytes).
+ * Sets 3 independent bits — one per hash function.  A token is "present"
+ * only if all 3 of its bits are set; a missing bit is a definitive negative.
+ * Three hashes with different algebraic structures (multiplicative / FNV /
+ * additive) minimise hash correlation while staying cheap. */
 static void bloom_add(uint8_t *bf, uint32_t bits,
                       const uint8_t *token, size_t tlen)
 {
     if (tlen == 0) return;
-    uint32_t h1 = bloom_djb2 (token, tlen) % bits;
+    uint32_t h1 = bloom_djb2 (token, tlen) % bits;   /* bit index in filter */
     uint32_t h2 = bloom_fnv1a(token, tlen) % bits;
     uint32_t h3 = bloom_sdbm (token, tlen) % bits;
-    bf[h1 / 8] |= (uint8_t)(1u << (h1 % 8));
+    bf[h1 / 8] |= (uint8_t)(1u << (h1 % 8));         /* byte index / bit pos */
     bf[h2 / 8] |= (uint8_t)(1u << (h2 % 8));
     bf[h3 / 8] |= (uint8_t)(1u << (h3 % 8));
 }
@@ -130,6 +138,9 @@ bloom_query(const uint8_t *bf, uint32_t bits,
 
 typedef void (*token_cb)(const uint8_t *tok, size_t tlen, void *ud);
 
+/* Returns 1 if c is a token delimiter — matches the Python regex character
+ * class [ ":\n\r\t,{}\[\]] used in bloom.py.  Note: '=' is NOT a delimiter,
+ * so "user=admin" is one token in plaintext logs, not two. */
 static int is_delim(uint8_t c)
 {
     return c == ' ' || c == '"' || c == ':' || c == '\n' ||
@@ -167,52 +178,63 @@ static void build_main_bloom(uint8_t *bf, const uint8_t *raw, size_t len)
 }
 
 /* -------------------------------------------------------------------------
- * JSON field extraction helpers
- * Given a JSON line and a key name, find the string value (or number value).
- * Returns pointer to value start in `line` and sets *vlen, or NULL.
- * Very simple: looks for `"key"` followed by `:` and then `"value"` or digits.
+ * JSON field extraction helpers.
+ * Given one JSON line and a key name, return a pointer to the value bytes
+ * and set *vlen_out — or return NULL if the key is absent.
+ *
+ * This is a lightweight scanner, not a full JSON parser:
+ *   - Finds the pattern  "key"  in the line.
+ *   - Skips whitespace and expects ':'.
+ *   - Handles two value types:
+ *       string  — bounded by double-quotes: "value"
+ *       number  — digit sequence (integer or float, possibly negative)
+ *   - Does NOT handle nested objects, arrays, escaped quotes, or null/bool.
+ *     For audit log fields (user, ip, action, level) these are always
+ *     plain strings or small integers, so this is sufficient.
  * ------------------------------------------------------------------------- */
 
 static const char *json_find_value(const char *line, size_t line_len,
                                    const char *key, size_t *vlen_out)
 {
     size_t klen = strlen(key);
-    /* Build search pattern `"key"` */
-    /* We search for `"key"` and then skip whitespace and `:` */
-    const char *p = line;
+    const char *p   = line;
     const char *end = line + line_len;
 
     while (p < end) {
-        /* Find next `"` */
+        /* Step 1: find the next opening double-quote — start of a key */
         const char *q = memchr(p, '"', (size_t)(end - p));
         if (!q) break;
-        q++; /* skip opening quote */
-        /* Does the key match? */
+        q++; /* skip the opening quote; q now points at the first key char */
+
+        /* Step 2: check if the key matches exactly, followed by '"' */
         if (q + klen + 1 <= end &&
             memcmp(q, key, klen) == 0 && q[klen] == '"') {
-            /* Found the key — now look for : and value */
-            const char *v = q + klen + 1; /* skip closing quote */
+
+            /* Step 3: skip closing quote, optional whitespace, then ':' */
+            const char *v = q + klen + 1;
             while (v < end && (*v == ' ' || *v == '\t')) v++;
-            if (v >= end || *v != ':') { p = q; continue; }
+            if (v >= end || *v != ':') { p = q; continue; } /* false key match */
             v++; /* skip ':' */
             while (v < end && (*v == ' ' || *v == '\t')) v++;
             if (v >= end) break;
+
             if (*v == '"') {
-                /* string value */
+                /* Step 4a: string value — collect until closing '"' or newline */
                 v++; /* skip opening quote */
                 const char *vs = v;
                 while (v < end && *v != '"' && *v != '\n') v++;
                 *vlen_out = (size_t)(v - vs);
                 return vs;
             } else if (isdigit((unsigned char)*v) || *v == '-') {
-                /* numeric value */
+                /* Step 4b: numeric value — collect digits, '.', '-' */
                 const char *vs = v;
                 while (v < end && (isdigit((unsigned char)*v) || *v == '.' || *v == '-')) v++;
                 *vlen_out = (size_t)(v - vs);
                 return vs;
             }
+            /* Other value types (null, bool, array, nested object) — skip */
         }
-        p = q;
+        p = q; /* advance past the quote we just examined */
     }
     return NULL;
 }
@@ -242,7 +264,12 @@ static void build_field_bloom(uint8_t *fb, const uint8_t *raw, size_t raw_len,
                                int fmt)
 {
     memset(fb, 0, FIELD_BLOOM_BYTES);
-    if (fmt != FORMAT_JSON) return; /* leave as zeros for non-JSON */
+    /* Zero bytes is the sentinel meaning "no field index" — search.py checks
+     * any(field_bloom) before applying field filters, so a zero-filled bloom
+     * causes the field-filter skip to be bypassed entirely for this chunk.
+     * This lets syslog/plaintext chunks pass through to the main bloom check
+     * without false negatives. */
+    if (fmt != FORMAT_JSON) return;
 
     /* Split into lines, parse each JSON line for field values */
     const char *p   = (const char *)raw;
@@ -276,39 +303,45 @@ static const char *TS_KEYS[] = {
     "timestamp", "time", "ts", "@timestamp", NULL
 };
 
-/* Try to parse ISO 8601 string: "2025-01-15T10:23:45" or "2025-01-15 10:23:45"
- * Also handles trailing Z and timezone offsets by truncating. */
+/* Try to parse ISO 8601 string: "2025-01-15T10:23:45" or "2025-01-15 10:23:45".
+ * Trailing 'Z' and timezone offsets are silently ignored — we truncate to
+ * 25 chars before the copy, which cuts off "+00:00" etc.  Precision is
+ * seconds (sub-second parts are also truncated).  timegm() interprets the
+ * struct tm as UTC, which matches the Python calendar.timegm() call. */
 static uint64_t parse_iso8601(const char *s, size_t slen)
 {
-    if (slen < 10) return 0;
+    if (slen < 10) return 0;          /* need at least "YYYY-MM-DD" */
     char buf[32];
-    size_t n = slen < 25 ? slen : 25;
+    size_t n = slen < 25 ? slen : 25; /* cap at 25: "2025-01-15T10:23:45.123Z" */
     memcpy(buf, s, n);
     buf[n] = '\0';
-    /* replace 'T' separator with space for strptime */
+    /* strptime doesn't recognise 'T' as a separator; replace with space */
     for (size_t i = 0; i < n; i++)
         if (buf[i] == 'T') buf[i] = ' ';
     struct tm tm = {0};
     char *end = strptime(buf, "%Y-%m-%d %H:%M:%S", &tm);
-    if (!end) end = strptime(buf, "%Y-%m-%d", &tm);
+    if (!end) end = strptime(buf, "%Y-%m-%d", &tm); /* date-only fallback */
     if (!end) return 0;
-    tm.tm_isdst = -1;
+    tm.tm_isdst = -1;   /* let timegm ignore DST — it always returns UTC */
     time_t t = timegm(&tm);
     return (t < 0) ? 0 : (uint64_t)t;
 }
 
-/* Parse numeric string as unix epoch (integer seconds or float seconds) */
+/* Parse a numeric string as a unix epoch (integer or float seconds).
+ * The range check 1e9..9e9 accepts years ~2001–2255; anything outside
+ * that window is almost certainly not a timestamp (e.g. a port number,
+ * HTTP status code, or latency value). */
 static uint64_t parse_numeric_ts(const char *s, size_t slen)
 {
-    if (slen == 0 || slen > 20) return 0;
+    if (slen == 0 || slen > 20) return 0; /* >20 digits can't be a valid epoch */
     char buf[24];
     memcpy(buf, s, slen);
     buf[slen] = '\0';
     char *endp;
     double v = strtod(buf, &endp);
-    if (endp == buf) return 0;
-    if (v < 1e9 || v > 9e9) return 0; /* sanity: year ~2001-2255 */
-    return (uint64_t)v;
+    if (endp == buf) return 0;   /* not a number */
+    if (v < 1e9 || v > 9e9) return 0;
+    return (uint64_t)v;          /* truncate fractional seconds */
 }
 
 /* Syslog month names */
@@ -319,11 +352,11 @@ static const char *MONTHS[] = {
 
 static uint64_t parse_syslog_ts(const char *line, size_t line_len)
 {
-    if (line_len < 15) return 0;
+    if (line_len < 15) return 0;  /* RFC 3164 prefix is exactly 15 chars */
     char buf[20];
     memcpy(buf, line, 15);
     buf[15] = '\0';
-    /* Format: "Jan 15 10:23:45" */
+    /* Expected format: "Jan 15 10:23:45" — no year in RFC 3164 */
     char mon[4]; int day, hh, mm, ss;
     if (sscanf(buf, "%3s %d %d:%d:%d", mon, &day, &hh, &mm, &ss) != 5)
         return 0;
@@ -331,23 +364,29 @@ static uint64_t parse_syslog_ts(const char *line, size_t line_len)
     for (int i = 0; i < 12; i++)
         if (strcmp(mon, MONTHS[i]) == 0) { month = i; break; }
     if (month < 0) return 0;
-    /* Use current year (best approximation, same as Python) */
+    /* RFC 3164 omits the year; we assume the current calendar year, same as
+     * the Python implementation (calendar.timegm with the current year).
+     * This is the standard approximation — syslog files rarely span a year
+     * boundary in a single archive. */
     time_t now = time(NULL);
     struct tm *lt = localtime(&now);
     struct tm tm = {0};
-    tm.tm_year = lt->tm_year;
-    tm.tm_mon  = month;
-    tm.tm_mday = day;
-    tm.tm_hour = hh;
-    tm.tm_min  = mm;
-    tm.tm_sec  = ss;
+    tm.tm_year  = lt->tm_year;
+    tm.tm_mon   = month;
+    tm.tm_mday  = day;
+    tm.tm_hour  = hh;
+    tm.tm_min   = mm;
+    tm.tm_sec   = ss;
     tm.tm_isdst = -1;
     time_t t = timegm(&tm);
     return (t < 0) ? 0 : (uint64_t)t;
 }
 
-/* Extract min/max timestamps from a raw chunk.
- * Sets *min_ts, *max_ts (0 = none found). */
+/* Extract min/max unix epoch timestamps from a raw chunk.
+ * Iterates line-by-line; each line is parsed according to fmt.
+ * Sets *min_ts = *max_ts = 0 if no timestamps are found (stored as-is in the
+ * jump table — the search path treats 0 as "unknown" and does not skip
+ * such chunks when a time-range filter is active). */
 static void extract_timestamps(const uint8_t *raw, size_t raw_len, int fmt,
                                 uint64_t *min_ts, uint64_t *max_ts)
 {
@@ -389,33 +428,41 @@ static void extract_timestamps(const uint8_t *raw, size_t raw_len, int fmt,
 }
 
 /* -------------------------------------------------------------------------
- * Format detection — inspect first 5 non-empty lines.
+ * Format detection — inspect up to the first 5 non-empty lines.
  * Returns FORMAT_JSON, FORMAT_SYSLOG, or FORMAT_PLAINTEXT.
+ *
+ * Scoring:
+ *   JSON    — line starts with '{' and ends with '}'    (≥2 hits → JSON)
+ *   Syslog  — first 3 chars match a month abbreviation  (≥2 hits → syslog)
+ *   Plain   — fallback when neither threshold is reached
+ *
+ * Deliberately lenient (≥2 of 5, not strict majority) so that files whose
+ * first line is a comment or blank still detect correctly.
  * ------------------------------------------------------------------------- */
 
 static int detect_format(const uint8_t *data, size_t data_len)
 {
-    const char *p   = (const char *)data;
-    const char *end = p + data_len;
-    int json_count  = 0;
+    const char *p    = (const char *)data;
+    const char *end  = p + data_len;
+    int json_count   = 0;
     int syslog_count = 0;
     int lines_checked = 0;
 
     while (p < end && lines_checked < 5) {
-        /* Skip blank lines */
+        /* Skip blank / CR-only lines */
         while (p < end && (*p == '\n' || *p == '\r')) p++;
         if (p >= end) break;
         const char *nl = memchr(p, '\n', (size_t)(end - p));
         size_t line_len = nl ? (size_t)(nl - p) : (size_t)(end - p);
         if (line_len == 0) { p = nl ? nl + 1 : end; continue; }
 
-        /* JSON: starts with '{' and the last non-whitespace char is '}' */
+        /* JSON check: starts with '{', last non-whitespace is '}' */
         if (p[0] == '{') {
             const char *ep = nl ? nl - 1 : end - 1;
             while (ep > p && (*ep == '\r' || *ep == ' ' || *ep == '\t')) ep--;
             if (*ep == '}') json_count++;
         }
-        /* Syslog: starts with a 3-letter month abbreviation */
+        /* Syslog check: line opens with a 3-letter month abbreviation */
         if (line_len >= 3) {
             char mon[4]; memcpy(mon, p, 3); mon[3] = '\0';
             for (int i = 0; i < 12; i++) {
@@ -503,10 +550,19 @@ int compress_file(const char *input_path, const char *output_path)
     /* -----------------------------------------------------------------------
      * 3. Build sample array for ZDICT_trainFromBuffer (up to MAX_TRAIN_SAMPS
      *    samples of CHUNK_SIZE each, covering first TRAIN_LIMIT bytes).
+     *
+     * zstd dictionary training works best when samples are representative and
+     * uniform in size.  We present each 64 KB chunk from the training window
+     * as one sample — the same granularity used for compression — so the
+     * dictionary captures within-chunk repetition patterns (JSON keys,
+     * hostnames, service names, request paths).
+     *
+     * The zstd library requires ≥2 samples; files smaller than 2 × 64 KB are
+     * compressed without a dictionary (still correct, just less efficient).
      * --------------------------------------------------------------------- */
     uint32_t n_train_chunks = (uint32_t)(train_read / CHUNK_SIZE);
     if (n_train_chunks > MAX_TRAIN_SAMPS) n_train_chunks = MAX_TRAIN_SAMPS;
-    /* Need at least 2 samples for zstd dict training */
+    /* Need at least 2 samples; the library will return an error otherwise */
     int use_dict = (n_train_chunks >= 2);
 
     uint8_t  *dict_buf  = NULL;
@@ -594,9 +650,12 @@ int compress_file(const char *input_path, const char *output_path)
     }
 
     /* -----------------------------------------------------------------------
-     * 6. Jump table — grow dynamically
+     * 6. Jump table — allocated up-front with doubling growth.
+     *    Initial cap of 256 covers most small files without realloc.
+     *    A 1.5 GB HDFS log produces ~24 K entries; each realloc doubles so
+     *    we call it at most log2(24000/256) ≈ 7 times.
      * --------------------------------------------------------------------- */
-    uint32_t  cap     = 256;
+    uint32_t  cap      = 256;
     uint32_t  n_chunks = 0;
     JumpEntry *entries = (JumpEntry *)malloc((size_t)cap * sizeof(JumpEntry));
     if (!entries) {
@@ -605,7 +664,11 @@ int compress_file(const char *input_path, const char *output_path)
     }
 
     /* -----------------------------------------------------------------------
-     * 7. Main compression loop — seek back to start and re-read file
+     * 7. Main compression loop.
+     *    We read the file twice: first pass (above) loaded training data,
+     *    then we rewind here to compress from byte 0.  The double-read
+     *    keeps peak memory bounded to TRAIN_LIMIT + 2×CHUNK_SIZE regardless
+     *    of input file size.
      * --------------------------------------------------------------------- */
     rewind(fin);
 
@@ -639,23 +702,35 @@ int compress_file(const char *input_path, const char *output_path)
         /* 7c. Field bloom filter */
         build_field_bloom(e->field_bloom, raw_buf, raw_len, fmt);
 
-        /* 7d. SHA-256 hash chain:
-         *       chunk 0: SHA256(raw_bytes)
-         *       chunk N: SHA256(prev_hash || raw_bytes)
-         * Use EVP API (OpenSSL 3.x compatible).
+        /* 7d. SHA-256 hash chain over RAW (pre-compression) bytes.
+         *
+         *   chunk 0: SHA256(raw_bytes)
+         *   chunk N: SHA256(prev_hash || raw_bytes)
+         *
+         * Hashing raw bytes (not compressed) means the chain certifies log
+         * *content*, not an artifact of the compression algorithm.  A future
+         * zstd version producing different compressed bytes would not break
+         * existing archives.
+         *
+         * We use the EVP streaming API (OpenSSL 3.x) because we need to feed
+         * two separate buffers (prev_hash then raw_buf) into one digest.  The
+         * one-shot SHA256() helper in main.c is fine for single-buffer use.
+         *
+         * Note: EVP_MD_CTX_new/free per chunk is slightly wasteful; a future
+         * optimisation would reuse the context with EVP_MD_CTX_reset().
          */
         {
             uint8_t hash_out[32];
             EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
             EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL);
             if (n_chunks > 0)
-                EVP_DigestUpdate(mdctx, prev_hash, 32);
+                EVP_DigestUpdate(mdctx, prev_hash, 32); /* chain: prepend prev */
             EVP_DigestUpdate(mdctx, raw_buf, raw_len);
             unsigned int mdlen = 32;
             EVP_DigestFinal_ex(mdctx, hash_out, &mdlen);
             EVP_MD_CTX_free(mdctx);
             memcpy(e->chunk_hash, hash_out, 32);
-            memcpy(prev_hash, hash_out, 32);
+            memcpy(prev_hash,     hash_out, 32); /* carry forward for next chunk */
         }
 
         /* 7e. Timestamp extraction — use local vars to avoid packed-member ptr */
@@ -666,14 +741,21 @@ int compress_file(const char *input_path, const char *output_path)
             e->max_ts = max_ts;
         }
 
-        /* 7f. Compress */
+        /* 7f. Compress the raw chunk.
+         *     Bloom filters, hash, and timestamps are all computed above over
+         *     the raw bytes.  Compression happens last because it is the most
+         *     CPU-intensive step and we want all metadata to reflect raw data.
+         *     Level 3 balances speed vs ratio (same as the Python oracle). */
         size_t comp_size;
         if (use_dict && cdict) {
+            /* ZSTD_CDict is pre-digested by the library; using it is faster
+             * than re-loading the raw dict bytes on every call. */
             comp_size = ZSTD_compress_usingCDict(cctx,
                                                   comp_buf, comp_bound,
                                                   raw_buf,  raw_len,
                                                   cdict);
         } else {
+            /* No dict: file was < 2 chunks, or training failed gracefully. */
             comp_size = ZSTD_compressCCtx(cctx,
                                            comp_buf, comp_bound,
                                            raw_buf,  raw_len,
@@ -694,18 +776,25 @@ int compress_file(const char *input_path, const char *output_path)
     }
 
     /* -----------------------------------------------------------------------
-     * 8. Write jump table
+     * 8. Write jump table at the current end of file.
+     *    The offset is recorded now so it can be written into the footer.
+     *    The Python decompressor/search reads this offset from the footer,
+     *    seeks here, and reads n_chunks × JUMP_ENTRY_SIZE bytes.
      * --------------------------------------------------------------------- */
     uint64_t jt_offset = (uint64_t)ftell(fout);
     for (uint32_t i = 0; i < n_chunks; i++)
         write_jump_entry(fout, &entries[i]);
 
     /* -----------------------------------------------------------------------
-     * 9. Write footer: chain_hash(32) + jt_offset(8) + num_chunks(4)
+     * 9. Write 44-byte footer (Parquet-style).
+     *    Readers open the file, seek to EOF-44, and read these three fields
+     *    to bootstrap all subsequent access — no external index needed.
+     *    chain_hash is a convenience copy of the last chunk's hash; it lets
+     *    a quick integrity check skip re-reading the entire jump table.
      * --------------------------------------------------------------------- */
     fwrite(prev_hash,   1, 32,  fout);   /* chain_hash = last chunk's hash */
-    write_u64_le(fout, jt_offset);
-    write_u32_le(fout, n_chunks);
+    write_u64_le(fout, jt_offset);       /* byte offset of the jump table  */
+    write_u32_le(fout, n_chunks);        /* total number of chunks         */
 
     /* -----------------------------------------------------------------------
      * 10. Stats

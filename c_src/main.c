@@ -26,6 +26,8 @@
 /* -------------------------------------------------------------------------
  * Portable little-endian field readers.
  * Reading byte-by-byte keeps the code correct on big-endian hosts too.
+ * These are the read-side mirrors of the write_u*_le helpers in compress.c;
+ * both must agree on byte order or the file will be misread.
  * ------------------------------------------------------------------------- */
 
 static int read_u16_le(FILE *f, uint16_t *out)
@@ -64,6 +66,8 @@ static int read_u64_le(FILE *f, uint64_t *out)
 
 /* -------------------------------------------------------------------------
  * print_entry — one-line summary of a single jump-table entry.
+ * Prints the first 8 bytes of chunk_hash (16 hex chars) followed by "..."
+ * to keep the line readable; the full 32-byte hash is in the jump table.
  * ------------------------------------------------------------------------- */
 
 static void print_entry(uint32_t idx, const JumpEntry *e)
@@ -76,7 +80,7 @@ static void print_entry(uint32_t idx, const JumpEntry *e)
            e->orig_size,
            (unsigned long long)e->min_ts,
            (unsigned long long)e->max_ts);
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < 8; i++)        /* first 8 bytes = 16 hex chars */
         printf("%02x", e->chunk_hash[i]);
     printf("...\n");
 }
@@ -107,7 +111,9 @@ int main(int argc, char *argv[])
     }
 
     /* -----------------------------------------------------------------------
-     * inspect subcommand (or legacy: shrinker <file.logz>)
+     * inspect subcommand (or legacy bare-path: shrinker <file.logz>)
+     * The bare-path form predates the subcommand dispatcher and is kept for
+     * backwards compatibility with scripts that call the binary directly.
      * --------------------------------------------------------------------- */
     const char *logz_path = (strcmp(argv[1], "inspect") == 0 && argc >= 3)
                             ? argv[2] : argv[1];
@@ -182,10 +188,13 @@ int main(int argc, char *argv[])
      * Step 11: full jump table
      * --------------------------------------------------------------------- */
 
-    /* 5. Allocate and read all jump-table entries.
-     *    On x86-64 (LE) fread into a __attribute__((packed)) struct is
-     *    identical to reading field-by-field; sizeof(JumpEntry)==1600 is
-     *    guaranteed by the _Static_assert in shrinker.h.
+    /* 5. Allocate and read all jump-table entries in one fread call.
+     *    On x86-64 (LE) fread directly into a __attribute__((packed)) struct
+     *    is equivalent to field-by-field reading because the platform byte
+     *    order matches the on-disk LE layout.  The _Static_assert in
+     *    shrinker.h guarantees sizeof(JumpEntry) == 1600 with no padding.
+     *    On big-endian hosts each field would need byte-swapping; that path
+     *    is not yet implemented.
      */
     JumpEntry *entries = malloc((size_t)num_chunks * sizeof(JumpEntry));
     if (!entries) {
@@ -236,20 +245,25 @@ int main(int argc, char *argv[])
         printf("min_ts:          (none)\n");
     printf("max_ts:          %llu\n", (unsigned long long)global_max);
 
-    /* 8. Verify total orig_size against known HDFS_v4.logz value */
-    const uint64_t EXPECTED_ORIG = 1577982906ULL;
+    /* 8. Spot-check: compare total orig_size against the known value for
+     *    data/HDFS_v4.logz.  This is a development-time sanity check, not a
+     *    general correctness test — any other .logz file will print FAIL here
+     *    by design.  The real integrity check is the hash chain in section 9. */
+    const uint64_t EXPECTED_ORIG = 1577982906ULL;  /* HDFS_v4.logz only */
     int size_ok = (total_orig == EXPECTED_ORIG);
     printf("\norig_size check: %s  (got %llu, expected %llu)\n",
-           size_ok ? "PASS" : "FAIL",
+           size_ok ? "PASS" : "FAIL (expected for non-HDFS files)",
            (unsigned long long)total_orig,
            (unsigned long long)EXPECTED_ORIG);
 
     /* -----------------------------------------------------------------------
-     * Step 11 cross-validation: SHA-256 of first chunk's COMPRESSED bytes.
+     * Step 11 cross-validation: compute SHA-256 of the first chunk's
+     * COMPRESSED bytes and compare it against the stored chunk_hash[0].
      *
-     * The stored chunk_hash[0] is SHA-256 over the RAW (pre-compression)
-     * bytes, so this will print MISMATCH — that is expected and correct.
-     * Once decompression is wired up in a later step this will become MATCH.
+     * chunk_hash[0] is SHA-256 over the RAW (pre-decompression) bytes, so
+     * this comparison will always print MISMATCH — that is the expected and
+     * correct result.  It confirms the hash was indeed computed over raw data.
+     * This check will become MATCH once a decompress step is added here.
      * --------------------------------------------------------------------- */
     {
         uint32_t csz = entries[0].comp_size;
