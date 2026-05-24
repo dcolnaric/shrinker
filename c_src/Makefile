@@ -2,9 +2,9 @@ CC      = gcc
 CFLAGS_COMMON  = -Wall -Wextra -I.
 CFLAGS_DEBUG   = $(CFLAGS_COMMON) -g -O0 -fsanitize=address
 CFLAGS_RELEASE = $(CFLAGS_COMMON) -O3 -DNDEBUG
-LIBS    = -lzstd -lssl -lcrypto
+LIBS    = -lzstd -lssl -lcrypto -lm
 TARGET  = shrinker
-SRCS    = main.c
+SRCS    = main.c compress.c
 
 # Default target is debug
 debug: $(SRCS) shrinker.h

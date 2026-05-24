@@ -1,9 +1,14 @@
 /*
- * main.c — Shrinker C prototype (Phase 3 Steps 10-11)
+ * main.c — Shrinker C prototype (Phase 3 Steps 10-12)
  *
  * Step 10: validate header magic + version, read and print footer.
  * Step 11: read full jump table, print per-entry summaries, verify
  *          total decompressed size, cross-validate chunk-0 SHA-256.
+ * Step 12: compress subcommand — delegates to compress_file().
+ *
+ * Usage:
+ *   shrinker compress <input> <output.logz>
+ *   shrinker inspect  <file.logz>
  *
  * Exit codes:  0 = success
  *              1 = any error (bad args, I/O failure, wrong magic/version)
@@ -83,11 +88,31 @@ static void print_entry(uint32_t idx, const JumpEntry *e)
 int main(int argc, char *argv[])
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: shrinker <file.logz>\n");
+        fprintf(stderr, "usage:\n");
+        fprintf(stderr, "  shrinker compress <input> <output.logz>\n");
+        fprintf(stderr, "  shrinker inspect  <file.logz>\n");
         return 1;
     }
 
-    FILE *f = fopen(argv[1], "rb");
+    /* -----------------------------------------------------------------------
+     * compress subcommand
+     * --------------------------------------------------------------------- */
+    if (strcmp(argv[1], "compress") == 0) {
+        if (argc < 4) {
+            fprintf(stderr, "usage: shrinker compress <input> <output.logz>\n");
+            return 1;
+        }
+        int rc = compress_file(argv[2], argv[3]);
+        return (rc == 0) ? 0 : 1;
+    }
+
+    /* -----------------------------------------------------------------------
+     * inspect subcommand (or legacy: shrinker <file.logz>)
+     * --------------------------------------------------------------------- */
+    const char *logz_path = (strcmp(argv[1], "inspect") == 0 && argc >= 3)
+                            ? argv[2] : argv[1];
+
+    FILE *f = fopen(logz_path, "rb");
     if (!f) {
         fprintf(stderr, "error: cannot open '%s'\n", argv[1]);
         return 1;
