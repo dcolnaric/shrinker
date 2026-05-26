@@ -82,7 +82,7 @@ IMPORTANT: Decompression failure on a chunk is treated as TAMPERED (exit 1), not
 ## Current phase:
 Phase 2 — Compliance Features in Python. COMPLETE.
 Phase 3 — C core rewrite. Steps 10–21 complete.
-Phase 4 — CI / packaging. Step 22 complete.
+Phase 4 — CI / packaging. Steps 22–23 complete.
 
 Phase 2 steps (all done):
 Steps 1-2 DONE: SHA-256 hash chain in compress.py, verify command in verify.py + cli.py.
@@ -240,10 +240,25 @@ Step 22 DONE: GitHub Actions CI — static Linux binaries.
     changed TEST_LOG to data/nginx.log — the committed CI fixture works identically
     for a byte-exact round-trip test
 
+Step 23 DONE: GitHub Releases workflow on version tags.
+  - .github/workflows/release.yml: triggers on push of v* tags
+  - build-x86_64 + build-arm64: same Alpine Docker approach as ci.yml;
+    binary renamed to shrinker-linux-x86_64 / shrinker-linux-arm64 before
+    artifact upload so download in release job gives correctly-named files
+  - release job: downloads both artifacts, chmod +x (safe — runner user owns
+    downloaded files), generates shrinker-checksums.txt via sha256sum,
+    publishes release via softprops/action-gh-release@v2
+  - Release name: "Shrinker ${{ github.ref_name }}"
+  - generate_release_notes: true → auto-populated body from commits since last tag
+  - make_latest: true → marks release as current latest
+  - permissions: contents: write (release job only)
+  - Three assets per release: shrinker-linux-x86_64, shrinker-linux-arm64,
+    shrinker-checksums.txt
+  - First release: v0.1.0
+
 Next: Possible next steps:
-  - Step 23: C test suite (replace run_tests.py with a C test runner)
-  - Step 24: single-file release tarball / GitHub Releases upload from CI
-  - Step 25: S3 upload + Object Lock integration (aws-sdk-c or CLI wrapper)
+  - Step 24: S3 upload + Object Lock integration (aws-sdk-c or CLI wrapper)
+  - Step 25: C test suite (replace run_tests.py with a C test runner)
 
 ## Strategic pivot (confirmed — do not second-guess):
 ORIGINAL: DevOps cold storage cost savings tool
@@ -296,6 +311,7 @@ shrinker/
   .github/
     workflows/
       ci.yml       # builds x86-64 + ARM64 static binaries; runs Python test suite
+      release.yml  # triggered on v* tags; publishes GitHub Release with binaries + checksums
   README.md        # benchmarks, usage, file format, project status
   CLAUDE.md        # this file
   data/
