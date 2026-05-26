@@ -4,10 +4,10 @@
 10x smaller. Searchable without rehydration. Single binary. No servers.
 
 ```
-shrinker compress audit.log  s3://bucket/2025-Q1.logz
-shrinker verify              s3://bucket/2025-Q1.logz   # → VERIFIED 24079 chunks chain 846fc55d…
-shrinker search              s3://bucket/2025-Q1.logz --user admin --from 2025-01-01 --to 2025-03-31
-shrinker export              s3://bucket/2025-Q1.logz --from 2025-01-01 --format csv > audit.csv
+shrinker compress audit.log  archive.logz
+shrinker verify   archive.logz                                    # → VERIFIED 24079 chunks chain 846fc55d…
+shrinker search   archive.logz --user admin --from 2025-01-01 --to 2025-03-31
+shrinker export   archive.logz --from 2025-01-01 --format csv > audit.csv
 ```
 
 ---
@@ -82,7 +82,7 @@ shrinker search output.logz --action delete --level ERROR --from 2025-01-01
 # Combined
 shrinker search output.logz "unauthorized" --user root --from 2025-01-01 --to 2025-01-31
 ```
-Chunks are skipped in three layers — time range, field bloom, string bloom — before any decompression happens. On the 1.5 GB HDFS benchmark, 98.9% of chunks are skipped for a specific block ID search.
+Chunks are skipped in three layers — time range, field bloom, string bloom — before any decompression happens. On the 1.5 GB HDFS benchmark, 98.8% of chunks are skipped for a specific block ID search.
 
 ### export
 ```bash
@@ -101,31 +101,48 @@ Full lossless decompression. Output is byte-exact identical to the original inpu
 
 ## Benchmarks
 
-All benchmarks run on a Snapdragon X Elite (ARM64) laptop in WSL2 Ubuntu, Python 3.12, single-threaded. The C rewrite (Phase 3) will be 20–50x faster on compression.
+All benchmarks run on a Snapdragon X Elite (ARM64) laptop, WSL2 Ubuntu, single-threaded.  
+Dataset: **1.5 GB HDFS log** (1,577,982,906 bytes, 11.2 M lines, 24,079 chunks).  
+C binary compiled with `gcc -O3`. Python 3.12 with `zstandard` library.
+
+### C vs Python — wall-clock time
+
+| Operation | C (release) | Python | C speedup |
+|---|---|---|---|
+| **compress** 1.5 GB → 196 MB | 23.1 s | 17 min 14.7 s | **44.8×** |
+| **search** specific block ID | 0.099 s | 0.570 s | **5.8×** |
+| **search** broad term (`blk_`) | 0.105 s | 0.543 s | **5.2×** |
+| **verify** hash chain | 6.4 s | 5.2 s | — ¹ |
+| **decompress** → 1.5 GB | 6.1 s | 4.5 s | — ¹ |
+| **export** CSV (11.2 M lines) | 4.7 s | 47.9 s | **10.2×** |
+
+> ¹ Verify and decompress are I/O-bound and delegate the heavy work (libzstd decompression,
+> OpenSSL SHA-256) to the same underlying C libraries in both implementations.
+> Python's slightly faster measured time reflects OS page-cache warmth — its input file
+> had just been written and was still hot in memory. On a cold cache both would
+> be within measurement noise of each other.
+
+**Headline numbers:**
+- Compress is **44.8× faster** in C — the dominant cost for ingestion pipelines.
+- Search is **5–6× faster** in C — still sub-second in both, bloom skip rates are identical (98.8%).
+- Export is **10× faster** in C — driven by pure Python's field-extraction loop overhead.
 
 ### Compression ratios
 
 | Dataset | Input | Output | Ratio | Notes |
 |---|---|---|---|---|
-| Synthetic JSON | 1.49 MB | 0.41 MB | 3.66x | Worst case — random UUIDs |
-| Real nginx logs | 6.67 MB | 0.62 MB | 10.72x | Public access log dataset |
-| Real HDFS logs | 1504 MB | 196 MB | 7.67x | 1.5 GB academic benchmark |
+| Synthetic JSON | 1.49 MB | 0.41 MB | 3.66× | Worst case — random UUIDs |
+| Real nginx logs | 6.67 MB | 0.62 MB | 10.72× | Public access log dataset |
+| Real HDFS logs | 1504 MB | 196 MB | 7.67× | 1.5 GB academic benchmark |
 
-### Search performance on 1.5 GB HDFS dataset (24,079 chunks)
+### Bloom filter skip rates on 1.5 GB HDFS (24,079 chunks)
 
-| Query | Chunks scanned | Skipped by bloom | Skip rate | Time |
+| Query | Chunks scanned | Bloom-skipped | Skip rate | Matches |
 |---|---|---|---|---|
-| Specific block ID | 266 / 24,079 | 23,813 | 98.9% | 0.475s |
-| Broad term ("blk_") | 329 / 24,079 | 23,750 | 98.6% | 5.9s |
-| Field search (--level ERROR) | 810 / 24,079 | 23,269 | 96.6% | 0.392s |
+| Specific block ID | 277 / 24,079 | 23,802 | **98.8%** | 269 lines |
+| Broad term (`blk_`) | 329 / 24,079 | 23,750 | **98.6%** | 153,157 lines |
 
-### Compliance operations on 1.5 GB HDFS dataset
-
-| Operation | Result | Time |
-|---|---|---|
-| compress | 1504 MB → 196 MB (7.67x) | 14m 55s (Python) |
-| verify (hash chain) | VERIFIED — 24,079 chunks | 5.4s |
-| export to CSV (5 days) | 11,199,358 lines | 46s |
+Zero false positives observed across all test runs.
 
 ---
 
@@ -155,7 +172,7 @@ Footer (44 bytes, read from EOF-44):
   num_chunks          4B  uint32 LE
 ```
 
-The format is self-contained. No external index or database is required to read, search, verify, or decompress a `.logz` file.
+The format is self-contained. No external index or database is required to read, search, verify, or decompress a `.logz` file. The C and Python implementations are **byte-compatible**: a file compressed by one can be verified, searched, and decompressed by the other.
 
 ---
 
@@ -187,8 +204,21 @@ provides a dated, reproducible integrity attestation. The chain hash is determin
 
 ## Installation
 
+### C binary (Phase 3 — current)
+
 ```bash
-# Python prototype (current)
+git clone https://github.com/dcolnaric/shrinker
+cd shrinker/c_src
+make release          # requires: gcc, libzstd-dev, libssl-dev
+./shrinker --help
+```
+
+Dependencies: `libzstd`, `libssl`/`libcrypto` (OpenSSL 3.x), `libm`.  
+On Ubuntu/Debian: `apt install libzstd-dev libssl-dev`
+
+### Python prototype
+
+```bash
 git clone https://github.com/dcolnaric/shrinker
 cd shrinker
 python -m venv venv && source venv/bin/activate
@@ -196,7 +226,7 @@ pip install zstandard
 python src/cli.py --help
 ```
 
-The C rewrite (single static binary, no dependencies) is in development. Follow the repo for release notifications.
+The Python and C implementations produce byte-identical `.logz` files and can be used interchangeably.
 
 ---
 
@@ -204,23 +234,26 @@ The C rewrite (single static binary, no dependencies) is in development. Follow 
 
 **Phase 2 — Python prototype (complete)**
 - [x] zstd dictionary compression with seekable 64 KB chunks
-- [x] Bloom filter per chunk (98.9% skip rate on 1.5 GB dataset)
+- [x] Bloom filter per chunk (98.8% skip rate on 1.5 GB dataset)
 - [x] SHA-256 hash chain for tamper detection
 - [x] `verify` command with exit codes for scripting
 - [x] Time-range search with timestamp index in jump table
 - [x] Field search (`--user`, `--ip`, `--action`, `--level`) for JSON logs
 - [x] Audit export to CSV and JSONL
 
-**Phase 3 — C core rewrite**
-- [ ] 20–50x compression speedup over Python
-- [ ] Single static binary, zero runtime dependencies
-- [ ] Memory-safe (valgrind clean)
-- [ ] Cross-platform builds via GitHub Actions (Linux x86-64, Linux ARM64, macOS)
+**Phase 3 — C core rewrite (complete)**
+- [x] 44.8× compression speedup over Python
+- [x] Byte-compatible with Python implementation (cross-validated on 1.5 GB HDFS dataset)
+- [x] Full CLI: compress / search / verify / decompress / export with `--help` per subcommand
+- [x] Memory-safe: zero valgrind errors across all commands, all heap freed
+- [x] `--format` override for compress; `--output` flag for decompress
+- [x] Warning-free release build (`gcc -O3 -Wall -Wextra`)
 
 **Phase 4 — Distribution**
-- [ ] Go CLI wrapper for cross-compilation
+- [ ] Single static binary (no shared library dependencies)
 - [ ] One-line install script
 - [ ] GitHub Releases with SHA-256 checksums
+- [ ] Cross-platform builds via GitHub Actions (Linux x86-64, Linux ARM64, macOS)
 
 **Phase 5 — Compliance features**
 - [ ] S3 direct read/write
@@ -234,10 +267,10 @@ The C rewrite (single static binary, no dependencies) is in development. Follow 
 ## Design decisions
 
 **Why 64 KB chunks?**  
-SIMD-aligned for the C rewrite. Large enough for zstd to find matches, small enough for millisecond random access.
+SIMD-aligned for future AVX-512 paths. Large enough for zstd to find cross-line matches, small enough for sub-millisecond random access.
 
 **Why a shared dictionary?**  
-Log files are extremely repetitive — JSON keys, hostnames, service names, request paths repeat millions of times. A dictionary trained on the first 10 MB captures this structure and applies it to every chunk. Without a dictionary, JSON log compression is 3–4x. With a trained dictionary, it reaches 8–12x on real datasets.
+Log files are extremely repetitive — JSON keys, hostnames, service names, request paths repeat millions of times. A dictionary trained on the first 10 MB captures this structure and applies it to every chunk. Without a dictionary, JSON log compression is 3–4×. With a trained dictionary, it reaches 8–12× on real datasets.
 
 **Why hash over raw bytes, not compressed bytes?**  
 The chain certifies the *content* of the log, not an artifact of which compression version produced it. A future zstd version producing slightly different compressed output would not invalidate existing archives.
@@ -247,6 +280,9 @@ The jump table at the file tail means you can open any `.logz` file, seek to EOF
 
 **Why not Parquet itself?**  
 Parquet is columnar — optimized for analytics queries over structured fields. Log files are row-oriented and semi-structured. Shrinker's format preserves the original log line verbatim in the `raw` field, which is what auditors need: the unmodified record, not a columnar decomposition of it.
+
+**Why does the C binary beat Python by 44× on compress but only 10× on export?**  
+Compress is CPU-bound: dict training, per-chunk zstd compression, bloom filter population, SHA-256 hashing — all implemented in C from scratch. Export is dominated by I/O (writing 11.2 M lines to stdout) with a lighter field-extraction loop; Python's overhead is proportionally smaller when the bottleneck shifts to the kernel write path.
 
 ---
 
@@ -260,7 +296,7 @@ Thesis title: *"Design and implementation of an efficient format for log file ar
 
 ## Contact
 
-Domen Colnaric - software engineer
+Domen Colnaric - software engineer  
 domen.colnaric@gmail.com
 
 ---

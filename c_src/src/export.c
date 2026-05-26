@@ -322,7 +322,7 @@ int export_file(const char *logz_path, const char *from_date,
     }
 
     /* --- Validate VERSION --- */
-    uint16_t version;
+    uint16_t version = 0;
     if (read_u16_le(f, &version) != 0 || version != VERSION) {
         fprintf(stderr, "error: unsupported version %u (expected %u)\n",
                 version, VERSION);
