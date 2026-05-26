@@ -82,6 +82,7 @@ IMPORTANT: Decompression failure on a chunk is treated as TAMPERED (exit 1), not
 ## Current phase:
 Phase 2 — Compliance Features in Python. COMPLETE.
 Phase 3 — C core rewrite. Steps 10–21 complete.
+Phase 4 — CI / packaging. Step 22 complete.
 
 Phase 2 steps (all done):
 Steps 1-2 DONE: SHA-256 hash chain in compress.py, verify command in verify.py + cli.py.
@@ -214,10 +215,29 @@ Step 21 DONE: Append mode — extends hash chain across archive boundary.
   - create-if-not-exists chain hash matches plain compress (67a67e202471cfa5…)
   - All 7 Python test suites still pass after changes.
 
+Phase 4 steps:
+Step 22 DONE: GitHub Actions CI — static Linux binaries.
+  - .github/workflows/ci.yml: three jobs triggered on push/PR to main
+      build-x86_64: ubuntu-latest, Alpine 3.19 container, EXTRA_CFLAGS="-static"
+        → produces shrinker-linux-x86_64 artifact (musl static, no shared-lib deps)
+      build-arm64:  ubuntu-latest + QEMU, Alpine 3.19 arm64 container, same flags
+        → produces shrinker-linux-arm64 artifact (genuine ARM64 musl static)
+      test:         downloads both artifacts; runs 7-suite Python test suite +
+                    C binary smoke tests (compress → verify → search on data/nginx.log)
+  - Makefile: added EXTRA_CFLAGS = (empty default, overridable from CLI);
+    $(EXTRA_CFLAGS) appended to CFLAGS_RELEASE; -lpthread -ldl added to LIBS
+  - data/nginx.log: 1000-line CI fixture committed (was fully gitignored before);
+    .gitignore changed from data/ to data/* + !data/nginx.log
+  - c_src/shrinker binary removed from git tracking (added to .gitignore)
+  - Alpine static lib fix: zstd-dev alone does not ship libzstd.a; must also install
+    zstd-static and openssl-libs-static (Alpine splits static archives into
+    separate *-static packages, unlike Debian/Ubuntu)
+  - PAT must have 'workflow' scope to push .github/workflows/ files
+
 Next: Possible next steps:
-  - Step 22: C test suite (replace run_tests.py with a C test runner)
-  - Step 23: single-file static build / release packaging
-  - Step 24: S3 upload + Object Lock integration (aws-sdk-c or CLI wrapper)
+  - Step 23: C test suite (replace run_tests.py with a C test runner)
+  - Step 24: single-file release tarball / GitHub Releases upload from CI
+  - Step 25: S3 upload + Object Lock integration (aws-sdk-c or CLI wrapper)
 
 ## Strategic pivot (confirmed — do not second-guess):
 ORIGINAL: DevOps cold storage cost savings tool
@@ -266,10 +286,14 @@ shrinker/
       verify.c     # verify_file(): SHA-256 hash chain recomputation, TAMPERED/VERIFIED output
       decompress.c # decompress_file(): sequential full decompression, byte-exact round-trip
       export.c     # export_file(): CSV/JSONL export with Python-compatible escaping
-    Makefile       # debug (ASan) + release targets; -Iinclude; -lzstd -lssl -lcrypto -lm
+    Makefile       # debug/valgrind/release targets; EXTRA_CFLAGS overridable for static builds
+  .github/
+    workflows/
+      ci.yml       # builds x86-64 + ARM64 static binaries; runs Python test suite
   README.md        # benchmarks, usage, file format, project status
   CLAUDE.md        # this file
-  data/            # gitignored - put test log files here
+  data/
+    nginx.log      # 1000-line CI fixture (committed); larger test files gitignored
 
 ## Key design decisions:
 - 64KB chunks (SIMD-aligned for future AVX-512 paths)
@@ -283,6 +307,12 @@ shrinker/
 - Rehydration is 100% lossless — verified with diff (bit-exact round-trip)
 - verify exit codes: 0=clean, 1=tampered, 2=usage error
 - C and Python implementations are byte-compatible: all six commands cross-validate
+- Static builds use Alpine Linux containers (not musl-gcc on Ubuntu): Ubuntu's libcrypto.a
+  references __ctype_b_loc / __ctype_tolower_loc (glibc-specific), causing linker errors
+  when mixed with musl. Alpine compiles everything (zstd, openssl) for musl natively.
+- Alpine static lib split: zstd-dev + zstd-static; openssl-dev + openssl-libs-static
+  (-dev provides headers + .so; *-static provides the .a needed for -static linking)
+- EXTRA_CFLAGS is appended to CFLAGS_RELEASE only (not debug/valgrind — ASan + -static conflict)
 - Append reuses the archive's existing dict + format byte — all chunks in one archive
   always share the same dict; training a new dict on append would corrupt decompression
 - Append truncates at jt_offset (not at EOF) — old chunk data is never touched, so
