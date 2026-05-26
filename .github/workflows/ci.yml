@@ -44,13 +44,20 @@ jobs:
           ldd c_src/shrinker || true
           file c_src/shrinker
 
-      - name: Smoke tests
+      - name: Smoke tests (inside Alpine container)
+        # Run inside the same Alpine/musl container so the binary is already
+        # executable as root — no chmod needed on the host runner.
         run: |
-          chmod +x c_src/shrinker
-          c_src/shrinker --version
-          c_src/shrinker compress data/nginx.log /tmp/ci_test.logz
-          c_src/shrinker verify   /tmp/ci_test.logz
-          c_src/shrinker search   /tmp/ci_test.logz "GET" | wc -l
+          docker run --rm \
+            -v "${{ github.workspace }}:/work" \
+            -w /work \
+            alpine:3.19 \
+            sh -c "
+              c_src/shrinker --version &&
+              c_src/shrinker compress data/nginx.log /tmp/ci_test.logz &&
+              c_src/shrinker verify   /tmp/ci_test.logz &&
+              c_src/shrinker search   /tmp/ci_test.logz 'GET' | wc -l
+            "
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
