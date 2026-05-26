@@ -134,4 +134,12 @@ int decompress_file(const char *logz_path, const char *output_path);
 int export_file(const char *logz_path, const char *from_date,
                 const char *to_date, const char *format);
 
+/* append.c — append new entries to an existing archive, or create one.
+ * format_override: FORMAT_JSON / FORMAT_SYSLOG / FORMAT_PLAINTEXT to force a
+ *                  specific format when creating a new archive (ignored when
+ *                  appending to an existing archive — the archive's format
+ *                  byte is used instead), or -1 to auto-detect. */
+int append_file(const char *input_path, const char *archive_path,
+                int format_override);
+
 #endif /* SHRINKER_H */

@@ -6,7 +6,7 @@ CFLAGS_RELEASE = $(CFLAGS_COMMON) -O3 -DNDEBUG
 LIBS    = -lzstd -lssl -lcrypto -lm
 TARGET  = shrinker
 SRCS    = src/main.c src/compress.c src/search.c \
-          src/verify.c src/decompress.c src/export.c
+          src/verify.c src/decompress.c src/export.c src/append.c
 
 # Default target is debug (ASan enabled)
 debug: $(SRCS) include/shrinker.h

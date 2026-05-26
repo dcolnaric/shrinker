@@ -1,6 +1,7 @@
 import argparse
 import sys
 
+import append
 import compress
 import decompress
 import export
@@ -11,6 +12,7 @@ EXAMPLES = """
 examples:
   shrinker compress server.log server.logz
   shrinker compress server.log server.logz --format json
+  shrinker append server.log archive.logz
   shrinker search server.logz "payment failed"
   shrinker search server.logz "500"
   shrinker decompress archive.logz --output restored.log
@@ -34,6 +36,13 @@ def build_parser():
     c.add_argument('input', help='Input log file path')
     c.add_argument('output', help='Output .logz file path')
     c.add_argument('--format', choices=['json', 'syslog', 'plaintext'], help='Override auto-detected log format')
+
+    ap = sub.add_parser('append',
+                        help='Append new entries to an existing archive (creates if absent)')
+    ap.add_argument('input', help='Input log file path')
+    ap.add_argument('archive', help='Target .logz archive path')
+    ap.add_argument('--format', choices=['json', 'syslog', 'plaintext'],
+                    help='Override auto-detected format (create-new only)')
 
     s = sub.add_parser('search', help='Search a .logz file for matching lines')
     s.add_argument('file', help='Input .logz file path')
@@ -79,6 +88,8 @@ def main():
         sys.exit(0)
     if args.command == 'compress':
         compress.run(args)
+    elif args.command == 'append':
+        append.run(args)
     elif args.command == 'search':
         search.run(args)
     elif args.command == 'decompress':

@@ -44,6 +44,7 @@ static void help_root(void)
            "\n"
            "commands:\n"
            "  compress    Compress a log file to .logz format\n"
+           "  append      Append new entries to an existing archive\n"
            "  search      Search a .logz file for matching lines\n"
            "  decompress  Decompress a .logz file back to original bytes\n"
            "  verify      Verify the SHA-256 hash chain of a .logz file\n"
@@ -165,6 +166,32 @@ static void help_export(void)
            "  shrinker export archive.logz > audit.csv\n"
            "  shrinker export archive.logz --from 2025-01-01 --to 2025-12-31 > audit.csv\n"
            "  shrinker export archive.logz --format json > audit.jsonl\n");
+}
+
+static void help_append(void)
+{
+    printf("usage: shrinker append <input> <archive.logz> [options]\n"
+           "\n"
+           "Append new log entries to an existing archive.\n"
+           "Creates a new archive if the file does not exist.\n"
+           "\n"
+           "The hash chain is extended from the last chunk of the existing\n"
+           "archive, so the result passes 'verify' with full chain continuity.\n"
+           "New chunks use the existing archive's dictionary and format byte.\n"
+           "\n"
+           "arguments:\n"
+           "  input           Input log file path\n"
+           "  archive.logz    Target .logz archive (created if absent)\n"
+           "\n"
+           "options:\n"
+           "  --format FORMAT  Override auto-detected format when creating a\n"
+           "                   new archive.  Ignored for existing archives.\n"
+           "                   Choices: json, syslog, plaintext\n"
+           "  --help           Show this help message\n"
+           "\n"
+           "examples:\n"
+           "  shrinker append server.log archive.logz\n"
+           "  shrinker append /var/log/app.log archive.logz\n");
 }
 
 /* -------------------------------------------------------------------------
@@ -409,10 +436,53 @@ int main(int argc, char *argv[])
     }
 
     /* ------------------------------------------------------------------
+     * append
+     * ------------------------------------------------------------------ */
+    if (strcmp(argv[1], "append") == 0) {
+        if (has_help(argc, argv, 2)) { help_append(); return 0; }
+
+        if (argc < 4) {
+            fprintf(stderr,
+                    "append: missing required arguments <input> <archive.logz>\n\n");
+            help_append();
+            return 2;
+        }
+
+        const char *input   = argv[2];
+        const char *archive = argv[3];
+        int format_override = -1;   /* -1 = auto-detect (create-new only) */
+
+        for (int i = 4; i < argc; i++) {
+            if (strcmp(argv[i], "--format") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "append: --format requires an argument\n");
+                    return 2;
+                }
+                const char *fmt = argv[++i];
+                if      (strcmp(fmt, "json")      == 0) format_override = FORMAT_JSON;
+                else if (strcmp(fmt, "syslog")    == 0) format_override = FORMAT_SYSLOG;
+                else if (strcmp(fmt, "plaintext") == 0) format_override = FORMAT_PLAINTEXT;
+                else {
+                    fprintf(stderr,
+                        "append: invalid format '%s' — choose json, syslog, or plaintext\n",
+                        fmt);
+                    return 2;
+                }
+            } else {
+                fprintf(stderr, "append: unknown option '%s'\n", argv[i]);
+                return 2;
+            }
+        }
+
+        int rc = append_file(input, archive, format_override);
+        return (rc == 0) ? 0 : 1;
+    }
+
+    /* ------------------------------------------------------------------
      * Unknown subcommand
      * ------------------------------------------------------------------ */
     fprintf(stderr, "shrinker: unknown command '%s'\n\n"
-                    "valid commands: compress, search, decompress, verify, export\n"
+                    "valid commands: compress, append, search, decompress, verify, export\n"
                     "Run 'shrinker --help' for usage.\n",
             argv[1]);
     return 2;
