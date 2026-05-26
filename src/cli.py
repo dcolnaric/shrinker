@@ -37,7 +37,8 @@ def build_parser():
 
     s = sub.add_parser('search', help='Search a .logz file for matching lines')
     s.add_argument('file', help='Input .logz file path')
-    s.add_argument('query', help='Search query string')
+    s.add_argument('query', nargs='?', default='',
+                   help='Search query string (omit for field-filter-only search)')
     s.add_argument('--from', dest='from_date', metavar='DATE',
                    help='Start of time range (ISO date, e.g. 2025-01-01)')
     s.add_argument('--to', dest='to_date', metavar='DATE',

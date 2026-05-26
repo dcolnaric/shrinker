@@ -79,14 +79,15 @@ static void help_compress(void)
 
 static void help_search(void)
 {
-    printf("usage: shrinker search <file> <query> [options]\n"
+    printf("usage: shrinker search <file> [query] [options]\n"
            "\n"
            "Search a .logz file for lines matching query without full decompression.\n"
            "Uses bloom filters and the timestamp index to skip irrelevant chunks.\n"
+           "query is optional — omit it for field-filter-only search.\n"
            "\n"
            "arguments:\n"
            "  file            Input .logz file path\n"
-           "  query           Search query string\n"
+           "  query           Search query string (optional)\n"
            "\n"
            "options:\n"
            "  --from DATE      Start of time range (YYYY-MM-DD)\n"
@@ -100,7 +101,8 @@ static void help_search(void)
            "examples:\n"
            "  shrinker search server.logz \"payment failed\"\n"
            "  shrinker search server.logz \"500\" --from 2025-01-01 --to 2025-01-31\n"
-           "  shrinker search server.logz \"delete\" --user admin --level ERROR\n");
+           "  shrinker search server.logz \"delete\" --user admin --level ERROR\n"
+           "  shrinker search server.logz --user admin --action delete\n");
 }
 
 static void help_decompress(void)
@@ -250,14 +252,23 @@ int main(int argc, char *argv[])
     if (strcmp(argv[1], "search") == 0) {
         if (has_help(argc, argv, 2)) { help_search(); return 0; }
 
-        if (argc < 4) {
-            fprintf(stderr, "search: missing required arguments <file> <query>\n\n");
+        if (argc < 3) {
+            fprintf(stderr, "search: missing required argument <file>\n\n");
             help_search();
             return 2;
         }
 
         const char *file         = argv[2];
-        const char *query        = argv[3];
+        /* query is optional: omit it to do a field-filter-only search.
+         * Detect whether argv[3] is the query or the first option flag:
+         * known flags all start with "--"; anything else is the query. */
+        const char *query        = "";
+        int opt_start = 3;
+        if (argc >= 4 && !(argv[3][0] == '-' && argv[3][1] == '-')) {
+            query     = argv[3];
+            opt_start = 4;
+        }
+
         const char *from_date    = NULL;
         const char *to_date      = NULL;
         const char *field_user   = NULL;
@@ -265,7 +276,7 @@ int main(int argc, char *argv[])
         const char *field_action = NULL;
         const char *field_level  = NULL;
 
-        for (int i = 4; i < argc; i++) {
+        for (int i = opt_start; i < argc; i++) {
             if (strcmp(argv[i], "--from") == 0) {
                 if (i + 1 >= argc) { fprintf(stderr, "search: --from requires an argument\n"); return 2; }
                 from_date = argv[++i];

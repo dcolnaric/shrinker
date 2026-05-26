@@ -131,20 +131,23 @@ def _search(logz_path, query, from_ts=None, to_ts=None, field_filters=None):
                     skipped_by_field += 1
                     continue
 
-            if bf is not None and not bloom.query_present(bf, query_bytes):
-                # Main bloom guarantees no false negatives — safe to skip entirely
+            # Main bloom: skip only when a non-empty query is definitely absent.
+            # An empty query (field-filter-only search) bypasses the bloom check
+            # so every chunk that passes time/field filters is scanned.
+            if query_bytes and bf is not None and not bloom.query_present(bf, query_bytes):
                 skipped_by_bloom += 1
                 continue
             chunks_scanned += 1
             f.seek(offset)
             raw = decompressor.decompress(f.read(comp_size), orig_size)
 
-            if query_bytes not in raw:
-                # Bloom false positive — chunk passed the filter but query isn't here
+            # Quick full-chunk check: skip bloom false positives cheaply.
+            # Bypassed when query is empty (field-filter-only search).
+            if query_bytes and query_bytes not in raw:
                 continue
 
             for line in raw.split(b'\n'):
-                if line and query_bytes in line:
+                if line and (not query_bytes or query_bytes in line):
                     print(line.decode('utf-8', errors='replace'))
                     matches += 1
 

@@ -419,7 +419,10 @@ int search_file(const char *logz_path, const char *query,
          * in the 1024-byte (8192-bit) bloom.  A missing bit is a definitive
          * negative — no false negatives, only false positives.
          * ------------------------------------------------------------------ */
-        if (!main_bloom_query(e->bloom, query_bytes, query_len)) {
+        /* Main bloom: only active for non-empty queries.
+         * An empty query (field-filter-only search) skips this layer so
+         * every chunk that passes time/field filters is decompressed. */
+        if (query_len > 0 && !main_bloom_query(e->bloom, query_bytes, query_len)) {
             skipped_by_bloom++;
             continue;
         }
@@ -476,8 +479,9 @@ int search_file(const char *logz_path, const char *query,
             goto cleanup;
         }
 
-        /* Quick full-chunk check first to handle bloom false positives cheaply */
-        if (query_len == 0 ||
+        /* Quick full-chunk check: handle bloom false positives cheaply.
+         * Skipped when query is empty (field-filter-only) — no needle to find. */
+        if (query_len > 0 &&
             memmem(raw_buf, dec_size, query_bytes, query_len) == NULL)
             continue;
 
@@ -489,8 +493,10 @@ int search_file(const char *logz_path, const char *query,
                 memchr(p, '\n', (size_t)(end - p));
             size_t line_len = nl ? (size_t)(nl - p) : (size_t)(end - p);
 
+            /* When query is empty, every non-empty line matches. */
             if (line_len > 0 &&
-                memmem(p, line_len, query_bytes, query_len) != NULL) {
+                (query_len == 0 ||
+                 memmem(p, line_len, query_bytes, query_len) != NULL)) {
                 fwrite(p, 1, line_len, stdout);
                 fputc('\n', stdout);
                 matches++;
