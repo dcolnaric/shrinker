@@ -233,6 +233,12 @@ Step 22 DONE: GitHub Actions CI — static Linux binaries.
     zstd-static and openssl-libs-static (Alpine splits static archives into
     separate *-static packages, unlike Debian/Ubuntu)
   - PAT must have 'workflow' scope to push .github/workflows/ files
+  - Bug fix: build-x86_64 smoke tests moved inside Docker container (docker run step)
+    so chmod is never needed — binary built as root inside Alpine is already executable
+    there; host runner cannot chmod files owned by container root
+  - Bug fix: test_decompress.py was reading data/test.log (gitignored, absent in CI);
+    changed TEST_LOG to data/nginx.log — the committed CI fixture works identically
+    for a byte-exact round-trip test
 
 Next: Possible next steps:
   - Step 23: C test suite (replace run_tests.py with a C test runner)
