@@ -10,7 +10,7 @@ import compress
 import decompress
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data')
-TEST_LOG = os.path.join(DATA_DIR, 'test.log')
+TEST_LOG = os.path.join(DATA_DIR, 'nginx.log')
 
 
 class TestDecompress(unittest.TestCase):
