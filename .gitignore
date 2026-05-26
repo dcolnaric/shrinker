@@ -1,7 +1,12 @@
 venv/
 *.logz
-data/
+# Ignore data/ in general but track the small nginx.log CI test fixture.
+# Use data/* (not data/) so the !exception below is honoured by git.
+data/*
+!data/nginx.log
 src/__pycache__/
 tests/__pycache__/
+# Built binary — CI builds it from source
+c_src/shrinker
 CLAUDE.md
 CLAUDE.md:Zone.Identifier

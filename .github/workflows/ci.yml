@@ -1,0 +1,147 @@
+name: CI — static Linux binaries
+
+# Runs on every push to main and on every pull request targeting main.
+# Produces two fully static (musl) binaries: x86-64 and ARM64.
+# Both are uploaded as artifacts so any Linux machine can grab them
+# without installing runtime dependencies.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # x86-64 — static binary built inside an Alpine 3.19 container.
+  #
+  # Alpine uses musl libc natively, so every library (zstd, openssl) is already
+  # compiled for musl.  -static therefore works without any glibc/musl mixing.
+  # The resulting binary has zero shared-library dependencies.
+  # ---------------------------------------------------------------------------
+  build-x86_64:
+    name: Build — Linux x86-64 static (musl)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build static binary in Alpine container
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/work" \
+            -w /work \
+            alpine:3.19 \
+            sh -c "
+              apk add --no-cache gcc musl-dev zstd-dev openssl-dev make &&
+              make -C c_src release EXTRA_CFLAGS='-static'
+            "
+
+      - name: Verify binary is fully static
+        # ldd on a static binary prints "not a dynamic executable"
+        run: |
+          ldd c_src/shrinker || true
+          file c_src/shrinker
+
+      - name: Smoke tests
+        run: |
+          chmod +x c_src/shrinker
+          c_src/shrinker --version
+          c_src/shrinker compress data/nginx.log /tmp/ci_test.logz
+          c_src/shrinker verify   /tmp/ci_test.logz
+          c_src/shrinker search   /tmp/ci_test.logz "GET" | wc -l
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shrinker-linux-x86_64
+          path: c_src/shrinker
+
+  # ---------------------------------------------------------------------------
+  # ARM64 — same Alpine/musl approach, run under QEMU emulation.
+  #
+  # docker/setup-qemu-action registers binfmt handlers so the kernel can
+  # transparently execute arm64 ELF binaries.  The Alpine arm64 image then
+  # compiles and links natively inside that emulated environment, producing
+  # a genuine ARM64 musl-static binary.
+  # ---------------------------------------------------------------------------
+  build-arm64:
+    name: Build — Linux ARM64 static (musl via QEMU)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU for ARM64 emulation
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build static ARM64 binary in Alpine container
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "${{ github.workspace }}:/work" \
+            -w /work \
+            alpine:3.19 \
+            sh -c "
+              apk add --no-cache gcc musl-dev zstd-dev openssl-dev make &&
+              make -C c_src release EXTRA_CFLAGS='-static'
+            "
+
+      - name: Verify binary architecture
+        run: file c_src/shrinker
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shrinker-linux-arm64
+          path: c_src/shrinker
+
+  # ---------------------------------------------------------------------------
+  # Test — runs after both builds succeed.
+  #
+  # Downloads the x86-64 artifact and runs:
+  #   1. The 7-suite Python test suite (oracle-level correctness)
+  #   2. C binary smoke tests against the committed nginx.log sample
+  # The ARM64 artifact is also downloaded so it appears in the job summary
+  # and can be spot-checked, but is not executed (wrong arch for this runner).
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test — Python suite + C binary smoke
+    needs: [build-x86_64, build-arm64]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download x86-64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: shrinker-linux-x86_64
+          path: c_src/
+
+      - name: Download ARM64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: shrinker-linux-arm64
+          path: /tmp/arm64/
+
+      - name: Make binaries executable
+        run: |
+          chmod +x c_src/shrinker
+          chmod +x /tmp/arm64/shrinker
+
+      - name: Install Python dependencies
+        run: pip install zstandard
+
+      - name: Run Python test suite (7 suites)
+        run: python3 tests/run_tests.py
+
+      - name: C binary smoke tests (x86-64)
+        run: |
+          c_src/shrinker --version
+          c_src/shrinker compress data/nginx.log /tmp/ci_test.logz
+          c_src/shrinker verify   /tmp/ci_test.logz
+          c_src/shrinker search   /tmp/ci_test.logz "GET" | wc -l
+          file /tmp/arm64/shrinker   # confirm ARM64 ELF in artifact
