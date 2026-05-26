@@ -500,7 +500,8 @@ static void write_jump_entry(FILE *fout, const JumpEntry *e)
  * compress_file — public API
  * ------------------------------------------------------------------------- */
 
-int compress_file(const char *input_path, const char *output_path)
+int compress_file(const char *input_path, const char *output_path,
+                  int format_override)
 {
     /* -----------------------------------------------------------------------
      * 1. Open input file and read first TRAIN_LIMIT bytes for dict training
@@ -543,6 +544,11 @@ int compress_file(const char *input_path, const char *output_path)
      * 2. Detect format from first bytes
      * --------------------------------------------------------------------- */
     int fmt = detect_format(train_buf, train_read);
+    /* Allow caller to override auto-detection (format_override == -1 means auto) */
+    if (format_override == FORMAT_JSON ||
+        format_override == FORMAT_SYSLOG ||
+        format_override == FORMAT_PLAINTEXT)
+        fmt = format_override;
     const char *fmt_name = (fmt == FORMAT_JSON)     ? "json"
                          : (fmt == FORMAT_SYSLOG)   ? "syslog"
                                                     : "plaintext";

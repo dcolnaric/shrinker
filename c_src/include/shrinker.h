@@ -112,8 +112,11 @@ _Static_assert(sizeof(FileFooter) == FOOTER_SIZE,
  * Public API
  * ------------------------------------------------------------------------- */
 
-/* compress.c */
-int compress_file(const char *input_path, const char *output_path);
+/* compress.c
+ * format_override: FORMAT_JSON / FORMAT_SYSLOG / FORMAT_PLAINTEXT to force a
+ *                  specific format, or -1 to auto-detect from the first bytes. */
+int compress_file(const char *input_path, const char *output_path,
+                  int format_override);
 
 /* search.c */
 int search_file(const char *logz_path, const char *query,
