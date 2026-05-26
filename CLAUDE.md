@@ -82,7 +82,7 @@ IMPORTANT: Decompression failure on a chunk is treated as TAMPERED (exit 1), not
 ## Current phase:
 Phase 2 — Compliance Features in Python. COMPLETE.
 Phase 3 — C core rewrite. Steps 10–21 complete.
-Phase 4 — CI / packaging. Steps 22–23 complete.
+Phase 4 — CI / packaging. Steps 22–24 complete.
 
 Phase 2 steps (all done):
 Steps 1-2 DONE: SHA-256 hash chain in compress.py, verify command in verify.py + cli.py.
@@ -256,9 +256,26 @@ Step 23 DONE: GitHub Releases workflow on version tags.
     shrinker-checksums.txt
   - First release: v0.1.0
 
+Step 24 DONE: install.sh one-liner installer.
+  - install.sh in repo root; POSIX sh, no bashisms
+  - Platform detection: Linux only; x86_64 and aarch64/arm64; clear error on unsupported
+  - Downloader detection: curl preferred, wget fallback; neither → error
+  - GitHub API: fetches releases/latest JSON, parses tag_name + browser_download_url
+    with grep+sed (no jq dependency); matches asset URLs by "/<name>" suffix to avoid
+    partial matches
+  - Downloads shrinker-linux-{arch} and shrinker-checksums.txt from same release
+  - SHA-256 verification: grep expected hash from checksums file, compare with
+    sha256sum output; checksum mismatch → print both hashes + exit 1
+  - Install path: /usr/local/bin (if writable) else ~/.local/bin (mkdir -p)
+  - PATH hint printed if install dir not currently in PATH
+  - Cleanup: mktemp -d workspace removed by trap on EXIT/INT/TERM
+  - Tested on WSL2 Ubuntu: fetched v0.1.0, checksum OK, installed to ~/.local/bin,
+    --version confirmed
+  - One-liner: curl -fsSL https://raw.githubusercontent.com/dcolnaric/shrinker/main/install.sh | sh
+
 Next: Possible next steps:
-  - Step 24: S3 upload + Object Lock integration (aws-sdk-c or CLI wrapper)
-  - Step 25: C test suite (replace run_tests.py with a C test runner)
+  - Step 25: S3 upload + Object Lock integration (aws-sdk-c or CLI wrapper)
+  - Step 26: C test suite (replace run_tests.py with a C test runner)
 
 ## Strategic pivot (confirmed — do not second-guess):
 ORIGINAL: DevOps cold storage cost savings tool
@@ -312,6 +329,7 @@ shrinker/
     workflows/
       ci.yml       # builds x86-64 + ARM64 static binaries; runs Python test suite
       release.yml  # triggered on v* tags; publishes GitHub Release with binaries + checksums
+  install.sh       # POSIX sh one-liner installer; detects arch, downloads latest release, verifies checksum
   README.md        # benchmarks, usage, file format, project status
   CLAUDE.md        # this file
   data/
