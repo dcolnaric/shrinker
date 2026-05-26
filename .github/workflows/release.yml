@@ -1,0 +1,130 @@
+name: Release — static Linux binaries
+
+# Publishes a GitHub Release whenever a version tag (v*) is pushed.
+# Builds fully-static musl binaries for x86-64 and ARM64 using the same
+# Alpine Docker approach as ci.yml, then attaches them plus a SHA-256
+# checksum file to the release.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # x86-64 — identical build procedure to ci.yml build-x86_64.
+  # Binary is renamed to shrinker-linux-x86_64 before upload so the
+  # artifact and the eventual release asset share the same filename.
+  # ---------------------------------------------------------------------------
+  build-x86_64:
+    name: Build — Linux x86-64 static (musl)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build static binary in Alpine container
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/work" \
+            -w /work \
+            alpine:3.19 \
+            sh -c "
+              apk add --no-cache gcc musl-dev zstd-dev zstd-static openssl-dev openssl-libs-static make &&
+              make -C c_src release EXTRA_CFLAGS='-static'
+            "
+
+      - name: Rename binary to release asset name
+        run: cp c_src/shrinker shrinker-linux-x86_64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shrinker-linux-x86_64
+          path: shrinker-linux-x86_64
+
+  # ---------------------------------------------------------------------------
+  # ARM64 — QEMU-emulated Alpine build, identical to ci.yml build-arm64.
+  # ---------------------------------------------------------------------------
+  build-arm64:
+    name: Build — Linux ARM64 static (musl via QEMU)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU for ARM64 emulation
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build static ARM64 binary in Alpine container
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "${{ github.workspace }}:/work" \
+            -w /work \
+            alpine:3.19 \
+            sh -c "
+              apk add --no-cache gcc musl-dev zstd-dev zstd-static openssl-dev openssl-libs-static make &&
+              make -C c_src release EXTRA_CFLAGS='-static'
+            "
+
+      - name: Rename binary to release asset name
+        run: cp c_src/shrinker shrinker-linux-arm64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shrinker-linux-arm64
+          path: shrinker-linux-arm64
+
+  # ---------------------------------------------------------------------------
+  # Release — downloads both artifacts, generates SHA-256 checksums, then
+  # publishes a GitHub Release with all three files attached.
+  #
+  # Notes:
+  #   - chmod +x works here: artifact download creates files owned by the
+  #     runner user (unlike ci.yml's build step where container root owns them)
+  #   - generate_release_notes: true auto-populates body from commits since
+  #     the previous tag
+  #   - make_latest: true marks this as the current latest release
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish GitHub Release
+    needs: [build-x86_64, build-arm64]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download x86-64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: shrinker-linux-x86_64
+
+      - name: Download ARM64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: shrinker-linux-arm64
+
+      - name: Make binaries executable
+        # Artifacts are owned by the runner user after download — chmod is safe.
+        run: chmod +x shrinker-linux-x86_64 shrinker-linux-arm64
+
+      - name: Generate SHA-256 checksums
+        run: |
+          sha256sum shrinker-linux-x86_64 shrinker-linux-arm64 > shrinker-checksums.txt
+          cat shrinker-checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Shrinker ${{ github.ref_name }}"
+          generate_release_notes: true
+          make_latest: true
+          files: |
+            shrinker-linux-x86_64
+            shrinker-linux-arm64
+            shrinker-checksums.txt
