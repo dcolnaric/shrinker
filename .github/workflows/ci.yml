@@ -34,7 +34,7 @@ jobs:
             -w /work \
             alpine:3.19 \
             sh -c "
-              apk add --no-cache gcc musl-dev zstd-dev zstd-static openssl-dev openssl-libs-static make &&
+              apk add --no-cache gcc musl-dev zstd-dev zstd-static openssl-dev openssl-libs-static curl-dev curl-static zlib-dev zlib-static make &&
               make -C c_src release EXTRA_CFLAGS='-static'
             "
 
@@ -56,7 +56,8 @@ jobs:
               c_src/shrinker --version &&
               c_src/shrinker compress data/nginx.log /tmp/ci_test.logz &&
               c_src/shrinker verify   /tmp/ci_test.logz &&
-              c_src/shrinker search   /tmp/ci_test.logz 'GET' | wc -l
+              c_src/shrinker search   /tmp/ci_test.logz 'GET' | wc -l &&
+              c_src/shrinker search   /tmp/ci_test.logz 's3://bucket/key' 2>&1 | grep -q 'invalid' || true
             "
 
       - name: Upload artifact
@@ -92,7 +93,7 @@ jobs:
             -w /work \
             alpine:3.19 \
             sh -c "
-              apk add --no-cache gcc musl-dev zstd-dev zstd-static openssl-dev openssl-libs-static make &&
+              apk add --no-cache gcc musl-dev zstd-dev zstd-static openssl-dev openssl-libs-static curl-dev curl-static zlib-dev zlib-static make &&
               make -C c_src release EXTRA_CFLAGS='-static'
             "
 

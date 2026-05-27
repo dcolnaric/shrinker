@@ -83,6 +83,7 @@ IMPORTANT: Decompression failure on a chunk is treated as TAMPERED (exit 1), not
 Phase 2 — Compliance Features in Python. COMPLETE.
 Phase 3 — C core rewrite. Steps 10–21 complete.
 Phase 4 — CI / packaging. Steps 22–24 complete.
+Phase 5 — S3 integration. Step 27 complete.
 
 Phase 2 steps (all done):
 Steps 1-2 DONE: SHA-256 hash chain in compress.py, verify command in verify.py + cli.py.
@@ -273,9 +274,47 @@ Step 24 DONE: install.sh one-liner installer.
     --version confirmed
   - One-liner: curl -fsSL https://raw.githubusercontent.com/dcolnaric/shrinker/main/install.sh | sh
 
+Step 27 DONE: S3 direct read/write with AWS SigV4 auth (Phase 5).
+  - All subcommands accept s3://bucket/key paths for file/archive arguments
+  - compress, append: write to temp file then PUT to S3
+  - search, verify, decompress, export: GET from S3 to temp file then operate
+  - append with S3: HEAD to check existence; if present GET first, then PUT back
+  - c_src/include/s3.h: S3Url and S3Creds structs; s3_is_url / s3_parse_url /
+    s3_load_creds / s3_download / s3_upload / s3_exists declarations
+  - c_src/src/s3.c: complete implementation
+      * Credential chain: env vars → ~/.aws/credentials → EC2 IMDS (IMDSv1, 2 s timeout)
+      * Region: AWS_DEFAULT_REGION → AWS_REGION → ~/.aws/config → "us-east-1"
+      * --region flag on all subcommands overrides credential-chain region
+      * AWS Signature Version 4, virtual-hosted style endpoints:
+          us-east-1 → {bucket}.s3.amazonaws.com
+          other     → {bucket}.s3.{region}.amazonaws.com
+      * Signed headers (alphabetical): host; x-amz-content-sha256; x-amz-date
+        [; x-amz-security-token if session token present]
+      * SigV4 canonical request: empty canonical query string; canonical headers
+        block already ends with \n, then extra \n adds required blank separator
+      * s3_download: libcurl GET, write response body to file
+      * s3_upload: SHA-256 file before PUT (required by SigV4); PUT with
+        Content-Type: application/octet-stream
+      * s3_exists: HEAD with CURLOPT_NOBODY
+      * Lazy curl_global_init (called once via static flag)
+      * URL encoding: unreserved chars + '/' pass through; all others → %XX (UC hex)
+  - Makefile: added src/s3.c to SRCS; LIBS now includes -lcurl -lz
+    (curl → ssl/crypto/z link order)
+  - ci.yml + release.yml: added curl-dev curl-static zlib-dev zlib-static
+    to Alpine apk packages in all three build containers
+  - main.c: s3_to_tmp / tmp_to_s3 helpers; --region flag on all subcommands;
+    verify now parses options loop (--region) instead of hard argc > 3 check
+  - URL parsing verified: 8/8 unit tests pass (bucket/key extraction, leading-slash
+    stripping, error cases)
+  - SigV4 canonical request format verified: blank separator, host header,
+    regional endpoint, session token, key encoding — 11/11 assertions pass
+  - Local debug/valgrind builds require: sudo apt-get install libcurl4-openssl-dev
+  - Static release builds use Alpine containers (curl-dev + curl-static)
+
 Next: Possible next steps:
-  - Step 25: S3 upload + Object Lock integration (aws-sdk-c or CLI wrapper)
+  - Step 25: S3 Object Lock integration (WORM compliance for SOX/HIPAA)
   - Step 26: C test suite (replace run_tests.py with a C test runner)
+  - Step 28: Real S3 round-trip integration test in CI (LocalStack)
 
 ## Strategic pivot (confirmed — do not second-guess):
 ORIGINAL: DevOps cold storage cost savings tool
@@ -316,15 +355,20 @@ shrinker/
     include/
       shrinker.h   # all format constants (MAGIC, VERSION, CHUNK_SIZE, bloom sizes, etc.),
                    # JumpEntry + FileFooter structs with _Static_assert size checks, public API
+      s3.h         # S3Url + S3Creds structs; s3_is_url / s3_parse_url / s3_load_creds /
+                   # s3_download / s3_upload / s3_exists declarations
     src/
-      main.c       # CLI dispatcher: compress/append/search/verify/decompress/export/inspect subcommands
+      main.c       # CLI dispatcher: compress/append/search/verify/decompress/export subcommands;
+                   # S3 routing (s3_to_tmp / tmp_to_s3 helpers); --region flag on all commands
       compress.c   # compress_file(): full C compression pipeline, byte-compatible with Python
       append.c     # append_file(): extend existing archive in-place, continues hash chain
       search.c     # search_file(): three-layer skip + surgical decompress + grep
       verify.c     # verify_file(): SHA-256 hash chain recomputation, TAMPERED/VERIFIED output
       decompress.c # decompress_file(): sequential full decompression, byte-exact round-trip
       export.c     # export_file(): CSV/JSONL export with Python-compatible escaping
-    Makefile       # debug/valgrind/release targets; EXTRA_CFLAGS overridable for static builds
+      s3.c         # AWS SigV4 + libcurl: credential chain, GET/PUT/HEAD S3 operations
+    Makefile       # debug/valgrind/release targets; LIBS includes -lcurl -lz;
+                   # EXTRA_CFLAGS overridable for static builds
   .github/
     workflows/
       ci.yml       # builds x86-64 + ARM64 static binaries; runs Python test suite
@@ -365,6 +409,16 @@ shrinker/
 - CSV export: QUOTE_MINIMAL — only quote fields containing ',', '"', '\n', '\r'; double embedded '"'
 - JSON export: ensure_ascii=True — non-ASCII UTF-8 → \uXXXX; invalid UTF-8 → �
 - The orig_size check in inspect is hardcoded for HDFS_v4.logz; it will FAIL on any other file by design
+- S3 transport is a pure download-to-tmpfile / upload-from-tmpfile wrapper; all core logic
+  operates on local files — no S3-specific code in compress/search/verify/decompress/export
+- SigV4 virtual-hosted style: us-east-1 uses legacy endpoint (no region prefix) for max compat
+- Signed headers always include x-amz-content-sha256 (required by S3); session token added
+  as x-amz-security-token when present (alphabetically after x-amz-date in signed list)
+- url_encode_key preserves '/' as segment separator; all other non-unreserved bytes → %XX
+- EC2 IMDS timeout: 1 s connect / 2 s total — fails fast on non-EC2 machines
+- Local debug builds need: sudo apt-get install libcurl4-openssl-dev
+- Alpine static link order: -lcurl -lzstd -lssl -lcrypto -lz -lm -lpthread -ldl
+  (curl-static + zlib-static packages required in addition to existing openssl-libs-static)
 
 ## What we are NOT building:
 - Not a database
