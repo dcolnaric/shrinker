@@ -13,7 +13,7 @@ LIBS    = -lcurl -lzstd -lssl -lcrypto -lz -lm -lpthread -ldl
 TARGET  = shrinker
 SRCS    = src/main.c src/compress.c src/search.c \
           src/verify.c src/decompress.c src/export.c src/append.c \
-          src/s3.c
+          src/s3.c src/retention.c
 
 # Default target is debug (ASan enabled)
 debug: $(SRCS) include/shrinker.h include/s3.h

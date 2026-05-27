@@ -1,0 +1,21 @@
+# Shrinker retention policy example
+# Apply with: shrinker retention apply --config retention.yaml --dry-run
+
+streams:
+  # SOX: 7-year retention with Object Lock Compliance
+  - name: admin_actions
+    pattern: s3://my-bucket/archive/admin-*.logz
+    retention_days: 2555
+    lock: true
+
+  # SOC 2: 1-year retention with Object Lock Compliance
+  - name: user_logins
+    pattern: s3://my-bucket/archive/logins-*.logz
+    retention_days: 365
+    lock: true
+
+  # Debug logs: 90-day retention, no lock (delete when expired)
+  - name: debug_logs
+    pattern: s3://my-bucket/archive/debug-*.logz
+    retention_days: 90
+    lock: false

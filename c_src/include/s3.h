@@ -90,6 +90,41 @@ int s3_upload(const S3Creds *creds, const char *bucket, const char *key,
  * Returns 1 = exists, 0 = not found (404), -1 = error. */
 int s3_exists(const S3Creds *creds, const char *bucket, const char *key);
 
+/* -------------------------------------------------------------------------
+ * S3 object metadata (returned by s3_list)
+ * ------------------------------------------------------------------------- */
+
+/* Maximum objects returned by a single s3_list call (across all pages) */
+#define S3_LIST_MAX 10000
+
+typedef struct {
+    char key[1024];           /* object key (no leading slash)                */
+    char last_modified[40];   /* ISO 8601 UTC, e.g. "2025-01-15T10:30:00.000Z" */
+} S3Object;
+
+/* -------------------------------------------------------------------------
+ * Extended S3 operations (retention policy)
+ * ------------------------------------------------------------------------- */
+
+/* List objects in bucket with given key prefix.
+ * out       — caller-allocated array of at least max_out S3Object entries.
+ * max_out   — maximum entries to fill (recommend S3_LIST_MAX).
+ * Handles ListObjectsV2 pagination automatically.
+ * Returns number of objects found (0..max_out) or -1 on error. */
+int s3_list(const S3Creds *creds, const char *bucket, const char *prefix,
+            S3Object *out, int max_out);
+
+/* Set Object Lock retention on an existing object (PutObjectRetention).
+ * mode       — "COMPLIANCE" or "GOVERNANCE".
+ * until_date — ISO 8601 UTC retain-until date, e.g. "2032-01-15T00:00:00Z".
+ * Returns 0 on success, -1 on error. */
+int s3_set_retention(const S3Creds *creds, const char *bucket, const char *key,
+                     const char *mode, const char *until_date);
+
+/* Delete s3://bucket/key (DELETE request).
+ * Returns 0 on success, -1 on error. */
+int s3_delete_object(const S3Creds *creds, const char *bucket, const char *key);
+
 /* Check the Object Lock status of s3://bucket/key (HEAD request).
  * On success:
  *   If the object is locked:  mode_out = "COMPLIANCE" (or "GOVERNANCE"),

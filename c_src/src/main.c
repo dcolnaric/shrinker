@@ -37,12 +37,13 @@
 #include <unistd.h>            /* mkstemp, unlink, close */
 #include "shrinker.h"
 #include "s3.h"
+#include "retention.h"
 
 /* -------------------------------------------------------------------------
  * Version string
  * ------------------------------------------------------------------------- */
 
-#define VERSION_STRING "shrinker 0.2.1 (Phase 5 — S3 + Object Lock)"
+#define VERSION_STRING "shrinker 0.3.0 (Phase 5 — S3 + Object Lock + Retention DSL)"
 
 /* -------------------------------------------------------------------------
  * Help strings
@@ -63,6 +64,7 @@ static void help_root(void)
            "  verify       Verify the SHA-256 hash chain of a .logz file\n"
            "  export       Export log records to CSV or JSONL\n"
            "  verify-lock  Check S3 Object Lock status of a .logz object\n"
+           "  retention    Apply retention policy from a YAML config file\n"
            "\n"
            "global options:\n"
            "  --help       Show this help message\n"
@@ -241,6 +243,66 @@ static void help_append(void)
            "  shrinker append server.log archive.logz\n"
            "  shrinker append /var/log/app.log s3://my-bucket/archive.logz\n"
            "  shrinker append /var/log/app.log s3://my-bucket/archive.logz --lock 365\n");
+}
+
+static void help_retention(void)
+{
+    printf("usage: shrinker retention <subcommand> [options]\n"
+           "\n"
+           "Manage retention policies defined in a YAML config file.\n"
+           "\n"
+           "subcommands:\n"
+           "  apply    Enforce the retention policy (lock or delete objects)\n"
+           "\n"
+           "Run 'shrinker retention apply --help' for details.\n");
+}
+
+static void help_retention_apply(void)
+{
+    printf("usage: shrinker retention apply --config FILE [options]\n"
+           "\n"
+           "Apply a retention policy to S3 objects defined in a YAML config.\n"
+           "\n"
+           "For each stream in the config:\n"
+           "  1. Lists S3 objects matching the glob pattern.\n"
+           "  2. Checks current Object Lock status.\n"
+           "  3. If lock: true and object not locked  → apply Compliance lock.\n"
+           "  4. If retention expired and no lock     → delete the object.\n"
+           "  5. Otherwise                            → print current status.\n"
+           "\n"
+           "Config file format (retention.yaml):\n"
+           "  streams:\n"
+           "    - name: admin_actions\n"
+           "      pattern: s3://bucket/archive/admin-*.logz\n"
+           "      retention_days: 2555\n"
+           "      lock: true\n"
+           "\n"
+           "    - name: debug_logs\n"
+           "      pattern: s3://bucket/archive/debug-*.logz\n"
+           "      retention_days: 90\n"
+           "      lock: false\n"
+           "\n"
+           "options:\n"
+           "  --config FILE    Path to the retention YAML config (required)\n"
+           "  --dry-run        Print what would happen without making changes\n"
+           "  --region REGION  AWS region for S3 (overrides env/config)\n"
+           "  --help           Show this help message\n"
+           "\n"
+           "dry-run output:\n"
+           "  OK:           s3://bucket/key (locked COMPLIANCE, 847 days remaining)\n"
+           "  OK:           s3://bucket/key (unlocked, 120 days until expiry 2026-01-01)\n"
+           "  WOULD LOCK:   s3://bucket/key (retain until 2032-01-01)\n"
+           "  WOULD DELETE: s3://bucket/key\n"
+           "\n"
+           "retention_days reference:\n"
+           "  365   SOC 2  (1 year)\n"
+           "  366   HIPAA  (1 year — use 2190 for the full 6 years)\n"
+           "  2555  SOX    (7 years)\n"
+           "\n"
+           "examples:\n"
+           "  shrinker retention apply --config retention.yaml --dry-run\n"
+           "  shrinker retention apply --config retention.yaml\n"
+           "  shrinker retention apply --config retention.yaml --region eu-west-1\n");
 }
 
 static void help_verify_lock(void)
@@ -913,12 +975,80 @@ int main(int argc, char *argv[])
     }
 
     /* ------------------------------------------------------------------
+     * retention
+     *   shrinker retention apply --config FILE [--dry-run] [--region R]
+     * ------------------------------------------------------------------ */
+    if (strcmp(argv[1], "retention") == 0) {
+        if (argc < 3 || has_help(argc, argv, 2)) {
+            help_retention();
+            return 0;
+        }
+
+        if (strcmp(argv[2], "apply") == 0) {
+            if (has_help(argc, argv, 3)) { help_retention_apply(); return 0; }
+
+            const char *config_path     = NULL;
+            const char *region_override = NULL;
+            int         dry_run         = 0;
+
+            for (int i = 3; i < argc; i++) {
+                if (strcmp(argv[i], "--config") == 0) {
+                    if (i + 1 >= argc) {
+                        fprintf(stderr,
+                                "retention apply: --config requires an argument\n");
+                        return 2;
+                    }
+                    config_path = argv[++i];
+                } else if (strcmp(argv[i], "--dry-run") == 0) {
+                    dry_run = 1;
+                } else if (strcmp(argv[i], "--region") == 0) {
+                    if (i + 1 >= argc) {
+                        fprintf(stderr,
+                                "retention apply: --region requires an argument\n");
+                        return 2;
+                    }
+                    region_override = argv[++i];
+                } else {
+                    fprintf(stderr,
+                            "retention apply: unknown option '%s'\n", argv[i]);
+                    return 2;
+                }
+            }
+
+            if (!config_path) {
+                fprintf(stderr,
+                        "retention apply: --config FILE is required\n\n");
+                help_retention_apply();
+                return 2;
+            }
+
+            RetentionConfig cfg;
+            if (retention_parse_yaml(config_path, &cfg) != 0)
+                return 1;
+
+            if (dry_run)
+                fprintf(stderr, "(dry-run mode — no S3 changes will be made)\n");
+
+            int rc = retention_apply(&cfg, region_override, dry_run);
+            return (rc == 0) ? 0 : 1;
+        }
+
+        /* Unknown retention subcommand */
+        fprintf(stderr,
+                "retention: unknown subcommand '%s'\n\n"
+                "valid subcommands: apply\n"
+                "Run 'shrinker retention --help' for usage.\n",
+                argv[2]);
+        return 2;
+    }
+
+    /* ------------------------------------------------------------------
      * Unknown subcommand
      * ------------------------------------------------------------------ */
     fprintf(stderr,
             "shrinker: unknown command '%s'\n\n"
             "valid commands: compress, append, search, decompress, verify, "
-            "export, verify-lock\n"
+            "export, verify-lock, retention\n"
             "Run 'shrinker --help' for usage.\n",
             argv[1]);
     return 2;

@@ -30,6 +30,7 @@ shrinker export     output.logz --format json > audit.jsonl
 ./shrinker decompress <file.logz> <output.log>
 ./shrinker export     <file.logz> [--from DATE] [--to DATE] [--format csv|json]
 ./shrinker verify-lock s3://bucket/key          # check Object Lock status
+./shrinker retention apply --config retention.yaml [--dry-run]
 ./shrinker inspect    <file.logz>   # prints header, jump table summary, totals
 
 ## Proven benchmark numbers (already validated):
@@ -86,7 +87,7 @@ IMPORTANT: Decompression failure on a chunk is treated as TAMPERED (exit 1), not
 Phase 2 — Compliance Features in Python. COMPLETE.
 Phase 3 — C core rewrite. Steps 10–21 complete.
 Phase 4 — CI / packaging. Steps 22–24 complete.
-Phase 5 — S3 + Object Lock. Steps 27–28 complete.
+Phase 5 — S3 + Object Lock + Retention DSL. Steps 27–29 complete.
 
 Phase 2 steps (all done):
 Steps 1-2 DONE: SHA-256 hash chain in compress.py, verify command in verify.py + cli.py.
@@ -353,9 +354,45 @@ Step 28 DONE: S3 Object Lock Compliance Mode — --lock flag + verify-lock subco
   - Design: lock_days lives in S3 transport layer only (s3_upload / tmp_to_s3);
     compress_file() and append_file() remain pure local-file operations — clean separation
 
+Step 29 DONE: Retention policy YAML DSL.
+  - New subcommand: shrinker retention apply --config FILE [--dry-run] [--region R]
+  - retention.yaml format: streams list with name / pattern (glob) / retention_days / lock
+  - Hand-rolled YAML parser (no external deps):
+      * Line-by-line state machine: root → streams → in-entry
+      * Splits on first ':'; strips leading/trailing whitespace + surrounding quotes
+      * List items detected by "- " prefix; blank lines and # comments skipped
+      * Unknown keys silently ignored (forward-compatible)
+      * Validation: name non-empty, pattern starts with s3://, retention_days > 0
+      * Error messages include stream index / name; missing-streams → clear error
+  - Pattern matching: fnmatch() on key portion (POSIX, no extra deps)
+  - glob→prefix extraction: everything before the first '*' in the key portion
+    (used as S3 list prefix to narrow down API results)
+  - S3 operations added to s3.c / s3.h:
+      * sigv4_build_auth / make_signed_headers: canonical_qs parameter added
+        (pass "" for existing ops — backward-compatible; used for list/retention/delete)
+      * s3_list(): ListObjectsV2 (list-type=2, max-keys=1000, prefix); paginated via
+        NextContinuationToken; parses <Contents><Key>/<LastModified> from XML response;
+        query params sorted alphabetically (c < l < m < p); url_encode_qs_value()
+        encodes '/' as %2F (unlike url_encode_key which allows /)
+      * s3_set_retention(): PUT ?retention= with XML body <Retention><Mode>/<RetainUntilDate>
+        signed with "retention=" canonical query string; uses temp file for curl UPLOAD
+      * s3_delete_object(): DELETE with CURLOPT_CUSTOMREQUEST; 204 = success
+  - Retention decision logic (per object):
+      a. s3_check_lock() → is_locked, days_remaining
+      b. If locked and days_remaining > 0 → OK (print status)
+      c. If not locked and stream.lock=true and retention not expired → LOCK (or WOULD LOCK)
+      d. If retention expired and not locked → DELETE (or WOULD DELETE)
+      e. Otherwise → OK (print days until expiry)
+  - xml_find_value() helper: minimal <tag>value</tag> extractor, no external XML parser
+  - retention.yaml example committed to repo root
+  - VERSION_STRING bumped to 0.3.0
+  - New files: c_src/include/retention.h, c_src/src/retention.c
+  - Makefile: retention.c added to SRCS
+  - Compiled with zero warnings (-Wall -Wextra)
+
 Next: Possible next steps:
-  - Step 29: C test suite (replace run_tests.py with a C test runner)
-  - Step 30: Real S3 round-trip integration test in CI (LocalStack)
+  - Step 30: C test suite (replace run_tests.py with a C test runner)
+  - Step 31: Real S3 round-trip integration test in CI (LocalStack)
 
 ## Strategic pivot (confirmed — do not second-guess):
 ORIGINAL: DevOps cold storage cost savings tool
@@ -396,8 +433,12 @@ shrinker/
     include/
       shrinker.h   # all format constants (MAGIC, VERSION, CHUNK_SIZE, bloom sizes, etc.),
                    # JumpEntry + FileFooter structs with _Static_assert size checks, public API
-      s3.h         # S3Url + S3Creds structs; s3_is_url / s3_parse_url / s3_load_creds /
-                   # s3_download / s3_upload(+lock_days) / s3_exists / s3_check_lock declarations
+      s3.h         # S3Url + S3Creds + S3Object structs; full S3 API:
+                   # s3_is_url / s3_parse_url / s3_load_creds /
+                   # s3_download / s3_upload(+lock_days) / s3_exists /
+                   # s3_check_lock / s3_list / s3_set_retention / s3_delete_object
+      retention.h  # RetentionStream + RetentionConfig structs;
+                   # retention_parse_yaml / retention_apply declarations
     src/
       main.c       # CLI dispatcher: compress/append/search/verify/decompress/export/verify-lock;
                    # S3 routing (s3_to_tmp / tmp_to_s3 helpers); --region on all commands;
@@ -408,14 +449,17 @@ shrinker/
       verify.c     # verify_file(): SHA-256 hash chain recomputation, TAMPERED/VERIFIED output
       decompress.c # decompress_file(): sequential full decompression, byte-exact round-trip
       export.c     # export_file(): CSV/JSONL export with Python-compatible escaping
-      s3.c         # AWS SigV4 + libcurl: credential chain, GET/PUT/HEAD; Object Lock COMPLIANCE
+      s3.c         # AWS SigV4 + libcurl: credential chain, GET/PUT/HEAD/DELETE;
+                   # Object Lock COMPLIANCE; ListObjectsV2; PutObjectRetention
+      retention.c  # YAML parser (hand-rolled) + retention policy enforcement
     Makefile       # debug/valgrind/release targets; LIBS includes -lcurl -lz;
-                   # EXTRA_CFLAGS overridable for static builds
+                   # EXTRA_CFLAGS overridable for static builds; retention.c in SRCS
   .github/
     workflows/
       ci.yml       # builds x86-64 + ARM64 static binaries; runs Python test suite
       release.yml  # triggered on v* tags; publishes GitHub Release with binaries + checksums
   install.sh       # POSIX sh one-liner installer; detects arch, downloads latest release, verifies checksum
+  retention.yaml   # example retention policy config (3 streams: admin/logins/debug)
   README.md        # benchmarks, usage, file format, project status
   CLAUDE.md        # this file
   data/
@@ -468,6 +512,17 @@ shrinker/
 - lock_days lives in S3 transport layer only; compress_file/append_file are pure local ops
 - verify-lock is read-only (HEAD request); it never downloads the archive
 - resp_header_val() case-insensitive scan handles header name variations across regions
+- Retention YAML parser: hand-rolled, splits on first ':' → handles S3 URLs in values correctly
+- Glob→prefix: everything before the first '*' in the key portion; prefix narrows S3 list results
+- url_encode_qs_value() encodes '/' → %2F (unlike url_encode_key which preserves '/');
+  required for SigV4 canonical query string values
+- sigv4_build_auth / make_signed_headers: canonical_qs param added; existing callers pass ""
+- ListObjectsV2: sorted canonical query string: continuation-token < list-type < max-keys < prefix
+- xml_find_value(): minimal <tag>value</tag> extractor — no external XML library needed
+- s3_set_retention: PUT ?retention= (canonical_qs="retention=") with XML body via temp file
+- s3_delete_object: CURLOPT_CUSTOMREQUEST "DELETE"; AWS returns 204 No Content on success
+- Retention lock-until date = last_modified + retention_days (preserves original upload time)
+- fnmatch(key_glob, object_key, FNM_PATHNAME) — FNM_PATHNAME prevents * matching '/' across dirs
 
 ## What we are NOT building:
 - Not a database

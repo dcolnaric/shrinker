@@ -27,6 +27,7 @@
 #include <stdint.h>
 #include <ctype.h>
 #include <time.h>
+#include <unistd.h>            /* close, unlink, lseek */
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
 #include <curl/curl.h>
@@ -225,6 +226,7 @@ static void sigv4_build_auth(
     const char *method,
     const char *bucket,
     const char *key,
+    const char *canonical_qs,      /* sorted, percent-encoded; "" = empty */
     const char *region,
     const char *access_key,
     const char *secret_key,
@@ -316,13 +318,13 @@ static void sigv4_build_auth(
      * the required blank-line separator before the SignedHeaders line.       */
     char canonical_req[16384];
     snprintf(canonical_req, sizeof(canonical_req),
-             "%s\n"    /* method          */
-             "%s\n"    /* canonical URI   */
-             "\n"      /* empty query string */
+             "%s\n"    /* method                             */
+             "%s\n"    /* canonical URI                      */
+             "%s\n"    /* canonical query string (may be "") */
              "%s\n"    /* canonical headers + blank separator */
-             "%s\n"    /* signed headers  */
-             "%s",     /* payload hash    */
-             method, canonical_uri, canonical_hdrs,
+             "%s\n"    /* signed headers                     */
+             "%s",     /* payload hash                       */
+             method, canonical_uri, canonical_qs, canonical_hdrs,
              signed_hdrs_out, payload_sha256);
 
     /* ---- hash the canonical request ------------------------------------ */
@@ -383,10 +385,11 @@ static struct curl_slist *make_signed_headers(
     const char *method,
     const char *bucket,
     const char *key,
+    const char *canonical_qs,  /* sorted encoded query string; "" = none */
     const S3Creds *creds,
     const char *payload_sha256,
-    const char *lock_mode,    /* "COMPLIANCE" or "" */
-    const char *lock_until)   /* ISO 8601 date  or "" */
+    const char *lock_mode,     /* "COMPLIANCE" or "" */
+    const char *lock_until)    /* ISO 8601 date  or "" */
 {
     /* current UTC time */
     time_t now = time(NULL);
@@ -403,17 +406,20 @@ static struct curl_slist *make_signed_headers(
         snprintf(host, sizeof(host), "%s.s3.%s.amazonaws.com",
                  bucket, creds->region);
 
-    /* URL */
+    /* URL — append ?query_string when a canonical query string is present */
     char enc_key[4096];
     url_encode_key(key, enc_key, sizeof(enc_key));
     char url[5632];
-    snprintf(url, sizeof(url), "https://%s/%s", host, enc_key);
+    if (canonical_qs[0])
+        snprintf(url, sizeof(url), "https://%s/%s?%s", host, enc_key, canonical_qs);
+    else
+        snprintf(url, sizeof(url), "https://%s/%s", host, enc_key);
     curl_easy_setopt(ch, CURLOPT_URL, url);
 
     /* build Authorization value */
     char auth_value[1024];
     char signed_hdrs[256];
-    sigv4_build_auth(method, bucket, key, creds->region,
+    sigv4_build_auth(method, bucket, key, canonical_qs, creds->region,
                      creds->access_key, creds->secret_key, creds->session_token,
                      payload_sha256, datetime, dateonly,
                      lock_mode, lock_until,
@@ -681,7 +687,7 @@ int s3_download(const S3Creds *creds, const char *bucket, const char *key,
     if (!ch) { fclose(out); return -1; }
 
     struct curl_slist *hdrs = make_signed_headers(
-        ch, "GET", bucket, key, creds, EMPTY_PAYLOAD_SHA256, "", "");
+        ch, "GET", bucket, key, "", creds, EMPTY_PAYLOAD_SHA256, "", "");
 
     curl_easy_setopt(ch, CURLOPT_HTTPHEADER,    hdrs);
     curl_easy_setopt(ch, CURLOPT_WRITEFUNCTION, file_write);
@@ -743,7 +749,7 @@ int s3_upload(const S3Creds *creds, const char *bucket, const char *key,
     if (!ch) { fclose(in); return -1; }
 
     struct curl_slist *hdrs = make_signed_headers(
-        ch, "PUT", bucket, key, creds, payload_sha256, lock_mode, lock_until);
+        ch, "PUT", bucket, key, "", creds, payload_sha256, lock_mode, lock_until);
     hdrs = curl_slist_append(hdrs, "Content-Type: application/octet-stream");
 
     curl_easy_setopt(ch, CURLOPT_HTTPHEADER,      hdrs);
@@ -800,7 +806,7 @@ int s3_exists(const S3Creds *creds, const char *bucket, const char *key)
     if (!ch) return -1;
 
     struct curl_slist *hdrs = make_signed_headers(
-        ch, "HEAD", bucket, key, creds, EMPTY_PAYLOAD_SHA256, "", "");
+        ch, "HEAD", bucket, key, "", creds, EMPTY_PAYLOAD_SHA256, "", "");
 
     curl_easy_setopt(ch, CURLOPT_HTTPHEADER,    hdrs);
     curl_easy_setopt(ch, CURLOPT_NOBODY,        1L);
@@ -836,7 +842,7 @@ int s3_check_lock(const S3Creds *creds, const char *bucket, const char *key,
     if (!ch) return -1;
 
     struct curl_slist *hdrs = make_signed_headers(
-        ch, "HEAD", bucket, key, creds, EMPTY_PAYLOAD_SHA256, "", "");
+        ch, "HEAD", bucket, key, "", creds, EMPTY_PAYLOAD_SHA256, "", "");
 
     curl_easy_setopt(ch, CURLOPT_HTTPHEADER,    hdrs);
     curl_easy_setopt(ch, CURLOPT_NOBODY,        1L);
@@ -886,6 +892,313 @@ int s3_check_lock(const S3Creds *creds, const char *bucket, const char *key,
                         "x-amz-object-lock-retain-until-date",
                         until_out, until_size);
         free(resp_hdrs.data);
+    }
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * URL encoding for query-string values.
+ * Like url_encode_key but encodes '/' as %2F (unreserved chars only).
+ * Required for SigV4 canonical query string values.
+ * ------------------------------------------------------------------------- */
+
+static void url_encode_qs_value(const char *in, char *out, size_t out_size)
+{
+    size_t j = 0;
+    for (size_t i = 0; in[i] && j + 4 < out_size; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            out[j++] = (char)c;
+        } else {
+            out[j++] = '%';
+            out[j++] = HEX_UC[c >> 4];
+            out[j++] = HEX_UC[c & 0x0f];
+        }
+    }
+    out[j] = '\0';
+}
+
+/* -------------------------------------------------------------------------
+ * Minimal XML value extractor.
+ *
+ * Scans `xml` starting at `start` for the first occurrence of <tag>value</tag>.
+ * Copies `value` into `out` (NUL-terminated, truncated to out_size-1).
+ * Returns a pointer to the character immediately after </tag>, or NULL if not found.
+ * ------------------------------------------------------------------------- */
+
+static const char *xml_find_value(const char *start,
+                                   const char *tag,
+                                   char *out, size_t out_size)
+{
+    char open_tag[128], close_tag[128];
+    snprintf(open_tag,  sizeof(open_tag),  "<%s>",  tag);
+    snprintf(close_tag, sizeof(close_tag), "</%s>", tag);
+
+    const char *p = strstr(start, open_tag);
+    if (!p) { if (out_size) out[0] = '\0'; return NULL; }
+    p += strlen(open_tag);
+
+    const char *end = strstr(p, close_tag);
+    if (!end) { if (out_size) out[0] = '\0'; return NULL; }
+
+    size_t len = (size_t)(end - p);
+    if (len >= out_size) len = out_size - 1;
+    memcpy(out, p, len);
+    out[len] = '\0';
+
+    return end + strlen(close_tag);
+}
+
+/* -------------------------------------------------------------------------
+ * s3_list — ListObjectsV2 with optional prefix, returns up to max_out entries.
+ *
+ * Uses list-type=2 (V2 API), max-keys=1000, optional prefix.
+ * Handles pagination automatically via NextContinuationToken.
+ *
+ * Returns number of objects found (0..max_out) or -1 on error.
+ * ------------------------------------------------------------------------- */
+
+int s3_list(const S3Creds *creds, const char *bucket, const char *prefix,
+            S3Object *out, int max_out)
+{
+    ensure_curl_init();
+
+    int total = 0;
+    char continuation_token[2048] = "";
+
+    for (;;) {  /* pagination loop */
+        /* Build canonical query string (params must be alphabetically sorted):
+         * continuation-token < list-type < max-keys < prefix
+         * Per SigV4 spec, parameter names and values must be percent-encoded. */
+        char enc_prefix[4096];
+        url_encode_qs_value(prefix, enc_prefix, sizeof(enc_prefix));
+
+        /* canonical_qs must hold two percent-encoded values (each up to 3×
+         * their original length) plus the fixed param names (~60 chars). */
+        char canonical_qs[20480];
+        if (continuation_token[0]) {
+            char enc_tok[4096];
+            url_encode_qs_value(continuation_token, enc_tok, sizeof(enc_tok));
+            snprintf(canonical_qs, sizeof(canonical_qs),
+                     "continuation-token=%s&list-type=2&max-keys=1000&prefix=%s",
+                     enc_tok, enc_prefix);
+        } else {
+            snprintf(canonical_qs, sizeof(canonical_qs),
+                     "list-type=2&max-keys=1000&prefix=%s",
+                     enc_prefix);
+        }
+
+        CURL *ch = curl_easy_init();
+        if (!ch) return -1;
+
+        /* key = "" → canonical URI = "/" (bucket-level list) */
+        struct curl_slist *hdrs = make_signed_headers(
+            ch, "GET", bucket, "", canonical_qs, creds,
+            EMPTY_PAYLOAD_SHA256, "", "");
+
+        MemBuf body = {0};
+        curl_easy_setopt(ch, CURLOPT_HTTPHEADER,    hdrs);
+        curl_easy_setopt(ch, CURLOPT_WRITEFUNCTION, membuf_write);
+        curl_easy_setopt(ch, CURLOPT_WRITEDATA,     &body);
+        curl_easy_setopt(ch, CURLOPT_FOLLOWLOCATION,1L);
+
+        CURLcode rc = curl_easy_perform(ch);
+        long http_code = 0;
+        curl_easy_getinfo(ch, CURLINFO_RESPONSE_CODE, &http_code);
+        curl_slist_free_all(hdrs);
+        curl_easy_cleanup(ch);
+
+        if (rc != CURLE_OK) {
+            fprintf(stderr, "s3: list failed: %s\n", curl_easy_strerror(rc));
+            free(body.data);
+            return -1;
+        }
+        if (http_code < 200 || http_code >= 300) {
+            fprintf(stderr, "s3: list HTTP %ld for s3://%s/ prefix='%s'\n",
+                    http_code, bucket, prefix);
+            free(body.data);
+            return -1;
+        }
+
+        /* Parse XML response — extract <Contents> blocks */
+        if (body.data) {
+            const char *p = body.data;
+            while (total < max_out) {
+                /* Find next <Contents> block */
+                const char *block_start = strstr(p, "<Contents>");
+                if (!block_start) break;
+                block_start += strlen("<Contents>");
+                const char *block_end = strstr(block_start, "</Contents>");
+                if (!block_end) break;
+
+                /* Extract Key and LastModified from this block */
+                size_t blen = (size_t)(block_end - block_start);
+                char block[4096];
+                if (blen >= sizeof(block)) blen = sizeof(block) - 1;
+                memcpy(block, block_start, blen);
+                block[blen] = '\0';
+
+                xml_find_value(block, "Key",
+                               out[total].key, sizeof(out[total].key));
+                xml_find_value(block, "LastModified",
+                               out[total].last_modified,
+                               sizeof(out[total].last_modified));
+
+                if (out[total].key[0])   /* only count entries with a key */
+                    total++;
+
+                p = block_end + strlen("</Contents>");
+            }
+
+            /* Check for pagination */
+            char is_truncated[16] = "false";
+            char next_token[2048] = "";
+            xml_find_value(body.data, "IsTruncated",
+                           is_truncated, sizeof(is_truncated));
+            xml_find_value(body.data, "NextContinuationToken",
+                           next_token, sizeof(next_token));
+
+            free(body.data);
+
+            if (strcmp(is_truncated, "true") == 0 && next_token[0] &&
+                total < max_out) {
+                strncpy(continuation_token, next_token,
+                        sizeof(continuation_token) - 1);
+                continue;  /* fetch next page */
+            }
+        } else {
+            free(body.data);
+        }
+
+        break;  /* done */
+    }
+
+    return total;
+}
+
+/* -------------------------------------------------------------------------
+ * s3_set_retention — PutObjectRetention (sets / extends Object Lock).
+ *
+ * Sends PUT /{key}?retention with an XML body specifying mode and date.
+ * mode should be "COMPLIANCE" or "GOVERNANCE".
+ * until_date should be ISO 8601 UTC, e.g. "2032-01-15T00:00:00Z".
+ *
+ * Returns 0 on success, -1 on error.
+ * ------------------------------------------------------------------------- */
+
+int s3_set_retention(const S3Creds *creds, const char *bucket, const char *key,
+                     const char *mode, const char *until_date)
+{
+    ensure_curl_init();
+
+    /* Build XML body */
+    char body[512];
+    int body_len = snprintf(body, sizeof(body),
+        "<Retention><Mode>%s</Mode>"
+        "<RetainUntilDate>%s</RetainUntilDate></Retention>",
+        mode, until_date);
+    if (body_len < 0 || (size_t)body_len >= sizeof(body)) {
+        fprintf(stderr, "s3: set-retention: XML body too long\n");
+        return -1;
+    }
+
+    /* Compute payload SHA-256 */
+    char payload_sha256[65];
+    sha256_str_hex(body, (size_t)body_len, payload_sha256);
+
+    /* Write body to a temp file so CURLOPT_UPLOAD can read it via fread */
+    char tmp[64];
+    strcpy(tmp, "/tmp/shrinker_ret_XXXXXX");
+    int fd = mkstemp(tmp);
+    if (fd < 0) { perror("s3: set-retention: mkstemp"); return -1; }
+    FILE *fp = fdopen(fd, "wb+");
+    if (!fp) { close(fd); unlink(tmp); return -1; }
+    fwrite(body, 1, (size_t)body_len, fp);
+    rewind(fp);
+
+    CURL *ch = curl_easy_init();
+    if (!ch) { fclose(fp); unlink(tmp); return -1; }
+
+    /* canonical_qs = "retention=" (empty value per SigV4 spec) */
+    struct curl_slist *hdrs = make_signed_headers(
+        ch, "PUT", bucket, key, "retention=", creds, payload_sha256, "", "");
+    hdrs = curl_slist_append(hdrs, "Content-Type: application/xml");
+
+    curl_easy_setopt(ch, CURLOPT_HTTPHEADER,       hdrs);
+    curl_easy_setopt(ch, CURLOPT_UPLOAD,           1L);
+    curl_easy_setopt(ch, CURLOPT_READDATA,         fp);
+    curl_easy_setopt(ch, CURLOPT_INFILESIZE_LARGE, (curl_off_t)body_len);
+    curl_easy_setopt(ch, CURLOPT_FOLLOWLOCATION,   1L);
+
+    MemBuf resp = {0};
+    curl_easy_setopt(ch, CURLOPT_WRITEFUNCTION, membuf_write);
+    curl_easy_setopt(ch, CURLOPT_WRITEDATA,     &resp);
+
+    CURLcode rc = curl_easy_perform(ch);
+    long http_code = 0;
+    curl_easy_getinfo(ch, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(ch);
+    fclose(fp);
+    unlink(tmp);
+
+    if (rc != CURLE_OK) {
+        fprintf(stderr, "s3: set-retention failed: %s\n", curl_easy_strerror(rc));
+        free(resp.data);
+        return -1;
+    }
+    if (http_code < 200 || http_code >= 300) {
+        fprintf(stderr, "s3: set-retention HTTP %ld for s3://%s/%s\n",
+                http_code, bucket, key);
+        if (resp.data) fprintf(stderr, "  %.256s\n", resp.data);
+        free(resp.data);
+        return -1;
+    }
+    free(resp.data);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * s3_delete_object — DELETE s3://bucket/key.
+ *
+ * Returns 0 on success, -1 on error.
+ * ------------------------------------------------------------------------- */
+
+int s3_delete_object(const S3Creds *creds, const char *bucket, const char *key)
+{
+    ensure_curl_init();
+
+    CURL *ch = curl_easy_init();
+    if (!ch) return -1;
+
+    struct curl_slist *hdrs = make_signed_headers(
+        ch, "DELETE", bucket, key, "", creds, EMPTY_PAYLOAD_SHA256, "", "");
+
+    curl_easy_setopt(ch, CURLOPT_HTTPHEADER,    hdrs);
+    curl_easy_setopt(ch, CURLOPT_CUSTOMREQUEST, "DELETE");
+    curl_easy_setopt(ch, CURLOPT_NOBODY,        0L);
+    curl_easy_setopt(ch, CURLOPT_FOLLOWLOCATION,1L);
+
+    MemBuf resp = {0};
+    curl_easy_setopt(ch, CURLOPT_WRITEFUNCTION, membuf_write);
+    curl_easy_setopt(ch, CURLOPT_WRITEDATA,     &resp);
+
+    CURLcode rc = curl_easy_perform(ch);
+    long http_code = 0;
+    curl_easy_getinfo(ch, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(ch);
+    free(resp.data);
+
+    if (rc != CURLE_OK) {
+        fprintf(stderr, "s3: delete failed: %s\n", curl_easy_strerror(rc));
+        return -1;
+    }
+    /* 204 No Content is the success response for DELETE */
+    if (http_code != 204 && (http_code < 200 || http_code >= 300)) {
+        fprintf(stderr, "s3: delete HTTP %ld for s3://%s/%s\n",
+                http_code, bucket, key);
+        return -1;
     }
     return 0;
 }
