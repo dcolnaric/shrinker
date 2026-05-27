@@ -1,24 +1,21 @@
 /*
- * s3.c — S3 read/write via libcurl + AWS Signature Version 4 (Phase 5 Step 27)
+ * s3.c — S3 read/write via libcurl + AWS Signature Version 4 (Phase 5 Steps 27–28)
  *
- * Implements the public API declared in s3.h:
+ * Step 27: credential chain, GET/PUT/HEAD, SigV4 signing.
+ * Step 28: Object Lock COMPLIANCE mode on PUT; verify-lock via HEAD.
  *
- *   s3_is_url()    — detect "s3://" prefix
- *   s3_parse_url() — split "s3://bucket/key" into bucket + key
- *   s3_load_creds()— AWS credential chain: env → ~/.aws/credentials → EC2 IMDS
- *   s3_download()  — GET  object → local temp file
- *   s3_upload()    — PUT  local file → S3 object
- *   s3_exists()    — HEAD request to check object existence
+ * Object Lock signing:
+ *   When lock_days > 0 in s3_upload(), two extra headers are added to the
+ *   SigV4 signed-headers list (alphabetically between x-amz-date and
+ *   x-amz-security-token):
+ *     x-amz-object-lock-mode: COMPLIANCE
+ *     x-amz-object-lock-retain-until-date: <ISO 8601 UTC>
+ *   They must be signed to prevent tampering in transit.
  *
- * Signing: AWS Signature Version 4, virtual-hosted style endpoints.
- *   Endpoint: https://{bucket}.s3.{region}.amazonaws.com/{key}
- *   (us-east-1 uses https://{bucket}.s3.amazonaws.com/{key} — no region prefix)
- *
- * Required headers signed in every request (alphabetical):
- *   host, x-amz-content-sha256, x-amz-date [, x-amz-security-token]
- *
- * Transport: libcurl handles TCP/TLS; we build the signed Authorization
- * header ourselves so there is no dependency on the AWS C SDK.
+ * s3_check_lock(): HEAD request + response-header capture.
+ *   AWS returns x-amz-object-lock-mode and
+ *   x-amz-object-lock-retain-until-date as response headers when the
+ *   object is locked.
  */
 
 #define _GNU_SOURCE          /* strdup, getenv */
@@ -36,10 +33,7 @@
 #include "s3.h"
 
 /* -------------------------------------------------------------------------
- * One-time libcurl global initialisation.
- * curl_global_init() must be called exactly once from the main thread
- * before any curl_easy_* calls.  We do it lazily the first time any S3
- * function needs a CURL handle.
+ * One-time libcurl global initialisation (lazy, single-threaded CLI)
  * ------------------------------------------------------------------------- */
 
 static void ensure_curl_init(void)
@@ -52,13 +46,13 @@ static void ensure_curl_init(void)
 }
 
 /* -------------------------------------------------------------------------
- * Growing memory buffer — used to accumulate curl response bodies.
+ * Growing memory buffer — used for response bodies and headers
  * ------------------------------------------------------------------------- */
 
 typedef struct {
     char  *data;
-    size_t size;   /* bytes written so far        */
-    size_t alloc;  /* total allocated (data+1 for NUL)  */
+    size_t size;
+    size_t alloc;
 } MemBuf;
 
 static size_t membuf_write(void *ptr, size_t size, size_t nmemb, void *userdata)
@@ -89,7 +83,6 @@ static size_t file_write(void *ptr, size_t size, size_t nmemb, void *userdata)
 
 static const char HEX_LC[] = "0123456789abcdef";
 
-/* In-place hex encode: out must be 2*len+1 bytes. */
 static void hex_encode(const uint8_t *in, size_t len, char *out)
 {
     for (size_t i = 0; i < len; i++) {
@@ -99,7 +92,6 @@ static void hex_encode(const uint8_t *in, size_t len, char *out)
     out[len*2] = '\0';
 }
 
-/* HMAC-SHA256(key, data) → 32-byte output */
 static void hmac_sha256(const uint8_t *key, size_t key_len,
                         const uint8_t *data, size_t data_len,
                         uint8_t out[32])
@@ -108,7 +100,6 @@ static void hmac_sha256(const uint8_t *key, size_t key_len,
     HMAC(EVP_sha256(), key, (int)key_len, data, data_len, out, &out_len);
 }
 
-/* SHA-256 of a byte string → lowercase hex.  hex_out must be 65 bytes. */
 static void sha256_str_hex(const char *str, size_t len, char hex_out[65])
 {
     uint8_t hash[32];
@@ -121,8 +112,6 @@ static void sha256_str_hex(const char *str, size_t len, char hex_out[65])
     hex_encode(hash, 32, hex_out);
 }
 
-/* SHA-256 of a file → lowercase hex.  hex_out must be 65 bytes.
- * Returns 0 on success, -1 on I/O error. */
 static int sha256_file_hex(const char *path, char hex_out[65])
 {
     uint8_t buf[65536], hash[32];
@@ -141,17 +130,11 @@ static int sha256_file_hex(const char *path, char hex_out[65])
     return 0;
 }
 
-/* SHA-256 hex of the empty string — used as payload hash for GET/HEAD. */
 #define EMPTY_PAYLOAD_SHA256 \
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 /* -------------------------------------------------------------------------
- * URL encoding for S3 object keys.
- *
- * Per the SigV4 spec for S3:
- *   - Unreserved chars (A-Z a-z 0-9 - _ . ~) are not encoded.
- *   - '/' is preserved as the path segment separator.
- *   - All other bytes are percent-encoded as %XX (uppercase hex).
+ * URL encoding for S3 object keys (unreserved chars + '/' pass through)
  * ------------------------------------------------------------------------- */
 
 static const char HEX_UC[] = "0123456789ABCDEF";
@@ -174,23 +157,68 @@ static void url_encode_key(const char *key, char *out, size_t out_size)
 }
 
 /* -------------------------------------------------------------------------
- * AWS Signature Version 4 — build the Authorization header value.
+ * Object Lock: compute the ISO 8601 UTC retain-until date.
+ * ------------------------------------------------------------------------- */
+
+static void compute_lock_until(int lock_days, char *out, size_t out_size)
+{
+    /* today + lock_days × 86400 s, expressed as UTC ISO 8601 */
+    time_t t = time(NULL) + (time_t)lock_days * 86400L;
+    struct tm *gmt = gmtime(&t);
+    strftime(out, out_size, "%Y-%m-%dT%H:%M:%SZ", gmt);
+}
+
+/* -------------------------------------------------------------------------
+ * Response-header scanner.
  *
- * Canonical request format (each field separated by '\n'):
- *   HTTPMethod
- *   CanonicalURI
- *   CanonicalQueryString          (empty for our requests)
- *   CanonicalHeaders              (each header: "name:value\n")
- *   SignedHeaders
- *   HexEncode(SHA256(Payload))
+ * AWS response headers are accumulated by membuf_write via
+ * CURLOPT_HEADERFUNCTION.  Each line is "Name: value\r\n".
+ * This function finds the first matching header (case-insensitive name)
+ * and copies the value (stripped of surrounding whitespace) into out.
+ * Returns 1 if found, 0 otherwise.
+ * ------------------------------------------------------------------------- */
+
+static int resp_header_val(const char *headers, const char *name,
+                           char *out, size_t out_size)
+{
+    size_t nlen = strlen(name);
+    const char *p = headers;
+    while (*p) {
+        if (strncasecmp(p, name, nlen) == 0 && p[nlen] == ':') {
+            p += nlen + 1;
+            while (*p == ' ' || *p == '\t') p++;
+            size_t i = 0;
+            while (*p && *p != '\r' && *p != '\n' && i + 1 < out_size)
+                out[i++] = *p++;
+            /* strip trailing whitespace */
+            while (i > 0 && (out[i-1] == ' ' || out[i-1] == '\t'))
+                i--;
+            out[i] = '\0';
+            return (i > 0);
+        }
+        /* advance to next line */
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') p++;
+    }
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * AWS Signature Version 4
  *
- * Note: CanonicalHeaders already ends with '\n'; appending another '\n'
- * in the canonical request creates the required blank-line separator
- * between the headers block and the SignedHeaders line.
+ * Signed headers are built in alphabetical order.  With Object Lock:
  *
- * Outputs:
- *   auth_out       — the full Authorization header value (caller sets header)
- *   signed_hdrs_out — the SignedHeaders string for x-amz-signed-headers
+ *   host
+ *   x-amz-content-sha256
+ *   x-amz-date
+ *   x-amz-object-lock-mode             (only when lock_mode != "")
+ *   x-amz-object-lock-retain-until-date (only when lock_until != "")
+ *   x-amz-security-token               (only when session token present)
+ *
+ * Parameters:
+ *   lock_mode  — "COMPLIANCE" or "" (empty = no Object Lock)
+ *   lock_until — ISO 8601 UTC date or "" (paired with lock_mode)
+ *   signed_hdrs_out — caller buffer, must be ≥ 256 bytes
  * ------------------------------------------------------------------------- */
 
 static void sigv4_build_auth(
@@ -201,18 +229,18 @@ static void sigv4_build_auth(
     const char *access_key,
     const char *secret_key,
     const char *session_token,    /* may be empty string, never NULL */
-    const char *payload_sha256,   /* 64-char hex */
+    const char *payload_sha256,
     const char *datetime,         /* "YYYYMMDDTHHMMSSZ" */
     const char *dateonly,         /* "YYYYMMDD" */
-    char *auth_out,  size_t auth_out_size,
-    char  signed_hdrs_out[128])
+    const char *lock_mode,        /* "COMPLIANCE" or "" */
+    const char *lock_until,       /* ISO 8601 or "" */
+    char *auth_out, size_t auth_out_size,
+    char  signed_hdrs_out[256])
 {
     int has_token = (session_token[0] != '\0');
+    int has_lock  = (lock_mode[0] != '\0' && lock_until[0] != '\0');
 
     /* ---- endpoint host -------------------------------------------------- */
-    /* Virtual-hosted style.  us-east-1 omits the region component in the
-     * legacy endpoint; both forms work, but we use the regional form for all
-     * other regions so the host matches the URL we actually connect to.      */
     char host[512];
     if (strcmp(region, "us-east-1") == 0)
         snprintf(host, sizeof(host), "%s.s3.amazonaws.com", bucket);
@@ -220,7 +248,23 @@ static void sigv4_build_auth(
         snprintf(host, sizeof(host), "%s.s3.%s.amazonaws.com", bucket, region);
 
     /* ---- signed headers list (alphabetical) ----------------------------- */
-    if (has_token)
+    /*
+     * Alphabetical order among x-amz-* headers:
+     *   x-amz-content-sha256 < x-amz-date < x-amz-object-lock-* < x-amz-security-token
+     * Within object-lock:
+     *   x-amz-object-lock-mode < x-amz-object-lock-retain-until-date
+     *   ('m' < 'r')
+     */
+    if (has_lock && has_token)
+        strcpy(signed_hdrs_out,
+               "host;x-amz-content-sha256;x-amz-date;"
+               "x-amz-object-lock-mode;x-amz-object-lock-retain-until-date;"
+               "x-amz-security-token");
+    else if (has_lock)
+        strcpy(signed_hdrs_out,
+               "host;x-amz-content-sha256;x-amz-date;"
+               "x-amz-object-lock-mode;x-amz-object-lock-retain-until-date");
+    else if (has_token)
         strcpy(signed_hdrs_out,
                "host;x-amz-content-sha256;x-amz-date;x-amz-security-token");
     else
@@ -232,34 +276,52 @@ static void sigv4_build_auth(
     char canonical_uri[5120];
     snprintf(canonical_uri, sizeof(canonical_uri), "/%s", enc_key);
 
-    /* ---- canonical headers (each line: "name:value\n") ------------------ */
-    char canonical_hdrs[6144];
-    if (has_token) {
-        snprintf(canonical_hdrs, sizeof(canonical_hdrs),
-                 "host:%s\n"
-                 "x-amz-content-sha256:%s\n"
-                 "x-amz-date:%s\n"
-                 "x-amz-security-token:%s\n",
-                 host, payload_sha256, datetime, session_token);
-    } else {
-        snprintf(canonical_hdrs, sizeof(canonical_hdrs),
-                 "host:%s\n"
-                 "x-amz-content-sha256:%s\n"
-                 "x-amz-date:%s\n",
-                 host, payload_sha256, datetime);
+    /* ---- canonical headers (alphabetical, each line ends with '\n') ----- */
+    /*
+     * Build the block dynamically so all four combinations (lock×token)
+     * are handled without nested ternaries.
+     */
+    char canonical_hdrs[8192];
+    {
+        int pos = 0;
+        /* host */
+        pos += snprintf(canonical_hdrs + pos, sizeof(canonical_hdrs) - (size_t)pos,
+                        "host:%s\n", host);
+        /* x-amz-content-sha256 */
+        pos += snprintf(canonical_hdrs + pos, sizeof(canonical_hdrs) - (size_t)pos,
+                        "x-amz-content-sha256:%s\n", payload_sha256);
+        /* x-amz-date */
+        pos += snprintf(canonical_hdrs + pos, sizeof(canonical_hdrs) - (size_t)pos,
+                        "x-amz-date:%s\n", datetime);
+        /* x-amz-object-lock-mode (if lock) */
+        if (has_lock)
+            pos += snprintf(canonical_hdrs + pos,
+                            sizeof(canonical_hdrs) - (size_t)pos,
+                            "x-amz-object-lock-mode:%s\n", lock_mode);
+        /* x-amz-object-lock-retain-until-date (if lock) */
+        if (has_lock)
+            pos += snprintf(canonical_hdrs + pos,
+                            sizeof(canonical_hdrs) - (size_t)pos,
+                            "x-amz-object-lock-retain-until-date:%s\n",
+                            lock_until);
+        /* x-amz-security-token (if present) */
+        if (has_token)
+            snprintf(canonical_hdrs + pos,
+                     sizeof(canonical_hdrs) - (size_t)pos,
+                     "x-amz-security-token:%s\n", session_token);
     }
 
     /* ---- canonical request ---------------------------------------------- */
-    /* canonical_hdrs already ends with '\n'.  The additional '\n' in "%s\n"
-     * below is the required blank separator before the SignedHeaders line. */
+    /* canonical_hdrs already ends with '\n'; the '\n' in "%s\n" below adds
+     * the required blank-line separator before the SignedHeaders line.       */
     char canonical_req[16384];
     snprintf(canonical_req, sizeof(canonical_req),
-             "%s\n"   /* method          */
-             "%s\n"   /* canonical URI   */
-             "\n"     /* empty query string */
-             "%s\n"   /* canonical headers (already \n-terminated) + separator */
-             "%s\n"   /* signed headers  */
-             "%s",    /* payload hash    */
+             "%s\n"    /* method          */
+             "%s\n"    /* canonical URI   */
+             "\n"      /* empty query string */
+             "%s\n"    /* canonical headers + blank separator */
+             "%s\n"    /* signed headers  */
+             "%s",     /* payload hash    */
              method, canonical_uri, canonical_hdrs,
              signed_hdrs_out, payload_sha256);
 
@@ -276,7 +338,7 @@ static void sigv4_build_auth(
     char sts[1024];
     snprintf(sts, sizeof(sts),
              "AWS4-HMAC-SHA256\n"
-             "%s\n"    /* datetime       */
+             "%s\n"    /* datetime         */
              "%s\n"    /* credential scope */
              "%s",     /* canonical request hash */
              datetime, cred_scope, cr_hash);
@@ -308,10 +370,12 @@ static void sigv4_build_auth(
 }
 
 /* -------------------------------------------------------------------------
- * Build the curl_slist of request headers and set CURLOPT_URL.
+ * Build the curl_slist of signed request headers and set CURLOPT_URL.
+ *
+ * lock_mode  — "COMPLIANCE" or "" (no lock)
+ * lock_until — ISO 8601 retain-until date or ""
  *
  * Returns a curl_slist* the caller must free with curl_slist_free_all().
- * On the same CURL handle, also sets CURLOPT_URL to the virtual-hosted URL.
  * ------------------------------------------------------------------------- */
 
 static struct curl_slist *make_signed_headers(
@@ -320,7 +384,9 @@ static struct curl_slist *make_signed_headers(
     const char *bucket,
     const char *key,
     const S3Creds *creds,
-    const char *payload_sha256)
+    const char *payload_sha256,
+    const char *lock_mode,    /* "COMPLIANCE" or "" */
+    const char *lock_until)   /* ISO 8601 date  or "" */
 {
     /* current UTC time */
     time_t now = time(NULL);
@@ -337,7 +403,7 @@ static struct curl_slist *make_signed_headers(
         snprintf(host, sizeof(host), "%s.s3.%s.amazonaws.com",
                  bucket, creds->region);
 
-    /* URL (url_encode_key keeps '/' as separator) */
+    /* URL */
     char enc_key[4096];
     url_encode_key(key, enc_key, sizeof(enc_key));
     char url[5632];
@@ -346,13 +412,14 @@ static struct curl_slist *make_signed_headers(
 
     /* build Authorization value */
     char auth_value[1024];
-    char signed_hdrs[128];
+    char signed_hdrs[256];
     sigv4_build_auth(method, bucket, key, creds->region,
                      creds->access_key, creds->secret_key, creds->session_token,
                      payload_sha256, datetime, dateonly,
+                     lock_mode, lock_until,
                      auth_value, sizeof(auth_value), signed_hdrs);
 
-    /* assemble curl_slist — Host: must be explicit to suppress curl's default */
+    /* assemble curl_slist (Host: explicit to suppress curl's automatic one) */
     struct curl_slist *hdrs = NULL;
     char hdr[2200];
 
@@ -364,6 +431,16 @@ static struct curl_slist *make_signed_headers(
 
     snprintf(hdr, sizeof(hdr), "x-amz-content-sha256: %s", payload_sha256);
     hdrs = curl_slist_append(hdrs, hdr);
+
+    /* Object Lock headers — must appear in slist (and in canonical request) */
+    if (lock_mode[0] && lock_until[0]) {
+        snprintf(hdr, sizeof(hdr), "x-amz-object-lock-mode: %s", lock_mode);
+        hdrs = curl_slist_append(hdrs, hdr);
+
+        snprintf(hdr, sizeof(hdr),
+                 "x-amz-object-lock-retain-until-date: %s", lock_until);
+        hdrs = curl_slist_append(hdrs, hdr);
+    }
 
     if (creds->session_token[0]) {
         snprintf(hdr, sizeof(hdr), "x-amz-security-token: %s",
@@ -381,13 +458,9 @@ static struct curl_slist *make_signed_headers(
  * Credential helpers
  * ------------------------------------------------------------------------- */
 
-/* Parse "key = value" from an INI-style line, stripping surrounding
- * whitespace.  Returns 1 if the key matched and a value was extracted,
- * 0 otherwise.  Does not null-terminate beyond out_size-1. */
 static int ini_get(const char *line, const char *key,
                    char *out, size_t out_size)
 {
-    /* skip leading whitespace */
     while (*line == ' ' || *line == '\t') line++;
     size_t klen = strlen(key);
     if (strncasecmp(line, key, klen) != 0) return 0;
@@ -396,7 +469,6 @@ static int ini_get(const char *line, const char *key,
     if (*line != '=') return 0;
     line++;
     while (*line == ' ' || *line == '\t') line++;
-    /* strip trailing whitespace / newline */
     size_t vlen = strlen(line);
     while (vlen > 0 && (line[vlen-1] == '\n' || line[vlen-1] == '\r' ||
                         line[vlen-1] == ' '  || line[vlen-1] == '\t'))
@@ -407,9 +479,6 @@ static int ini_get(const char *line, const char *key,
     return (vlen > 0);
 }
 
-/* Extract the string value for "key" from a minimal JSON object.
- * Only handles flat objects with simple string values (no escapes).
- * Returns 1 on success, 0 if not found. */
 static int json_str(const char *json, const char *key,
                     char *out, size_t out_size)
 {
@@ -428,16 +497,12 @@ static int json_str(const char *json, const char *key,
     return (i > 0);
 }
 
-/* Try to load credentials from the EC2/ECS Instance Metadata Service (IMDSv1).
- * Uses a very short timeout so non-EC2 machines fail fast (< 2 s).
- * Returns 0 on success, -1 on failure. */
 static int load_from_imds(S3Creds *creds)
 {
     ensure_curl_init();
     CURL *ch = curl_easy_init();
     if (!ch) return -1;
 
-    /* Step 1: discover the attached IAM role name */
     MemBuf role = {0};
     curl_easy_setopt(ch, CURLOPT_URL,
         "http://169.254.169.254/latest/meta-data/iam/security-credentials/");
@@ -453,13 +518,11 @@ static int load_from_imds(S3Creds *creds)
         curl_easy_cleanup(ch);
         return -1;
     }
-    /* strip trailing whitespace */
     while (role.size > 0 &&
            (role.data[role.size-1] == '\n' || role.data[role.size-1] == '\r' ||
             role.data[role.size-1] == ' '))
         role.data[--role.size] = '\0';
 
-    /* Step 2: fetch the credential JSON for that role */
     char url[512];
     snprintf(url, sizeof(url),
              "http://169.254.169.254/latest/meta-data/"
@@ -475,9 +538,9 @@ static int load_from_imds(S3Creds *creds)
     if (rc != CURLE_OK || !body.data) { free(body.data); return -1; }
 
     int ok = json_str(body.data, "AccessKeyId",
-                      creds->access_key,   sizeof(creds->access_key))   &&
+                      creds->access_key, sizeof(creds->access_key))  &&
              json_str(body.data, "SecretAccessKey",
-                      creds->secret_key,   sizeof(creds->secret_key));
+                      creds->secret_key, sizeof(creds->secret_key));
     json_str(body.data, "Token",
              creds->session_token, sizeof(creds->session_token));
     free(body.data);
@@ -496,9 +559,9 @@ int s3_is_url(const char *path)
 int s3_parse_url(const char *url, S3Url *out)
 {
     if (!s3_is_url(url)) return -1;
-    const char *rest  = url + 5;               /* skip "s3://"  */
+    const char *rest  = url + 5;
     const char *slash = strchr(rest, '/');
-    if (!slash) return -1;                     /* no key component */
+    if (!slash) return -1;
 
     size_t blen = (size_t)(slash - rest);
     if (blen == 0 || blen >= sizeof(out->bucket)) return -1;
@@ -506,8 +569,8 @@ int s3_parse_url(const char *url, S3Url *out)
     out->bucket[blen] = '\0';
 
     const char *key = slash + 1;
-    while (*key == '/') key++;                 /* strip redundant leading slashes */
-    if (*key == '\0') return -1;               /* empty key */
+    while (*key == '/') key++;
+    if (*key == '\0') return -1;
     size_t klen = strlen(key);
     if (klen >= sizeof(out->key)) return -1;
     memcpy(out->key, key, klen + 1);
@@ -518,15 +581,14 @@ int s3_load_creds(S3Creds *creds)
 {
     memset(creds, 0, sizeof(*creds));
 
-    /* ---- region: env → ~/.aws/config → default -------------------------- */
     const char *reg = getenv("AWS_DEFAULT_REGION");
     if (!reg || !*reg) reg = getenv("AWS_REGION");
     if (reg && *reg)
         strncpy(creds->region, reg, sizeof(creds->region) - 1);
     else
-        strcpy(creds->region, "us-east-1");   /* will be overridden by config */
+        strcpy(creds->region, "us-east-1");
 
-    /* ---- Tier 1: environment variables ----------------------------------- */
+    /* Tier 1: environment variables */
     const char *kid = getenv("AWS_ACCESS_KEY_ID");
     const char *sec = getenv("AWS_SECRET_ACCESS_KEY");
     if (kid && *kid && sec && *sec) {
@@ -540,12 +602,11 @@ int s3_load_creds(S3Creds *creds)
         return 0;
     }
 
-    /* ---- Tier 2: ~/.aws/credentials (and ~/.aws/config for region) ------- */
+    /* Tier 2: ~/.aws/credentials + ~/.aws/config */
     const char *home = getenv("HOME");
     if (home && *home) {
         char path[1024];
 
-        /* credentials file */
         snprintf(path, sizeof(path), "%s/.aws/credentials", home);
         FILE *f = fopen(path, "r");
         if (f) {
@@ -572,7 +633,6 @@ int s3_load_creds(S3Creds *creds)
             if (found_key && found_secret) goto region_from_config;
         }
 
-        /* config file (region only) */
     region_from_config:
         snprintf(path, sizeof(path), "%s/.aws/config", home);
         FILE *fc = fopen(path, "r");
@@ -594,7 +654,7 @@ int s3_load_creds(S3Creds *creds)
         if (creds->access_key[0] && creds->secret_key[0]) return 0;
     }
 
-    /* ---- Tier 3: EC2/ECS instance metadata (IMDSv1) --------------------- */
+    /* Tier 3: EC2/ECS instance metadata */
     if (load_from_imds(creds) == 0) return 0;
 
     fprintf(stderr,
@@ -621,7 +681,7 @@ int s3_download(const S3Creds *creds, const char *bucket, const char *key,
     if (!ch) { fclose(out); return -1; }
 
     struct curl_slist *hdrs = make_signed_headers(
-        ch, "GET", bucket, key, creds, EMPTY_PAYLOAD_SHA256);
+        ch, "GET", bucket, key, creds, EMPTY_PAYLOAD_SHA256, "", "");
 
     curl_easy_setopt(ch, CURLOPT_HTTPHEADER,    hdrs);
     curl_easy_setopt(ch, CURLOPT_WRITEFUNCTION, file_write);
@@ -652,11 +712,10 @@ int s3_download(const S3Creds *creds, const char *bucket, const char *key,
 }
 
 int s3_upload(const S3Creds *creds, const char *bucket, const char *key,
-              const char *local_path)
+              const char *local_path, int lock_days)
 {
     ensure_curl_init();
 
-    /* compute the file's SHA-256 — required for SigV4 PUT body hash */
     char payload_sha256[65];
     if (sha256_file_hex(local_path, payload_sha256) != 0) {
         fprintf(stderr, "s3: cannot hash '%s' for upload\n", local_path);
@@ -672,11 +731,19 @@ int s3_upload(const S3Creds *creds, const char *bucket, const char *key,
     curl_off_t file_size = (curl_off_t)ftell(in);
     rewind(in);
 
+    /* Object Lock parameters */
+    char lock_until[40] = "";
+    const char *lock_mode = "";
+    if (lock_days > 0) {
+        compute_lock_until(lock_days, lock_until, sizeof(lock_until));
+        lock_mode = "COMPLIANCE";
+    }
+
     CURL *ch = curl_easy_init();
     if (!ch) { fclose(in); return -1; }
 
     struct curl_slist *hdrs = make_signed_headers(
-        ch, "PUT", bucket, key, creds, payload_sha256);
+        ch, "PUT", bucket, key, creds, payload_sha256, lock_mode, lock_until);
     hdrs = curl_slist_append(hdrs, "Content-Type: application/octet-stream");
 
     curl_easy_setopt(ch, CURLOPT_HTTPHEADER,      hdrs);
@@ -685,7 +752,7 @@ int s3_upload(const S3Creds *creds, const char *bucket, const char *key,
     curl_easy_setopt(ch, CURLOPT_INFILESIZE_LARGE,file_size);
     curl_easy_setopt(ch, CURLOPT_FOLLOWLOCATION,  1L);
 
-    /* discard response body */
+    /* capture response body — needed to detect Object Lock config errors */
     MemBuf resp = {0};
     curl_easy_setopt(ch, CURLOPT_WRITEFUNCTION, membuf_write);
     curl_easy_setopt(ch, CURLOPT_WRITEDATA,     &resp);
@@ -696,17 +763,32 @@ int s3_upload(const S3Creds *creds, const char *bucket, const char *key,
     curl_slist_free_all(hdrs);
     curl_easy_cleanup(ch);
     fclose(in);
-    free(resp.data);
 
     if (rc != CURLE_OK) {
         fprintf(stderr, "s3: upload failed: %s\n", curl_easy_strerror(rc));
+        free(resp.data);
         return -1;
     }
     if (http_code < 200 || http_code >= 300) {
-        fprintf(stderr, "s3: upload HTTP %ld for s3://%s/%s\n",
-                http_code, bucket, key);
+        /* Check for Object Lock configuration errors (AWS returns 400
+         * InvalidRequest when the bucket was not created with Object Lock). */
+        if (lock_days > 0 && resp.data &&
+            (strstr(resp.data, "ObjectLock") != NULL ||
+             strstr(resp.data, "Object Lock") != NULL ||
+             strstr(resp.data, "InvalidRequest") != NULL)) {
+            fprintf(stderr,
+                    "s3: error: S3 bucket does not have Object Lock enabled.\n"
+                    "  Object Lock must be enabled when the bucket is created\n"
+                    "  (it cannot be added to an existing bucket).\n"
+                    "  Create a new bucket with 'Enable Object Lock' checked.\n");
+        } else {
+            fprintf(stderr, "s3: upload HTTP %ld for s3://%s/%s\n",
+                    http_code, bucket, key);
+        }
+        free(resp.data);
         return -1;
     }
+    free(resp.data);
     return 0;
 }
 
@@ -718,13 +800,12 @@ int s3_exists(const S3Creds *creds, const char *bucket, const char *key)
     if (!ch) return -1;
 
     struct curl_slist *hdrs = make_signed_headers(
-        ch, "HEAD", bucket, key, creds, EMPTY_PAYLOAD_SHA256);
+        ch, "HEAD", bucket, key, creds, EMPTY_PAYLOAD_SHA256, "", "");
 
     curl_easy_setopt(ch, CURLOPT_HTTPHEADER,    hdrs);
-    curl_easy_setopt(ch, CURLOPT_NOBODY,        1L);   /* HEAD method */
+    curl_easy_setopt(ch, CURLOPT_NOBODY,        1L);
     curl_easy_setopt(ch, CURLOPT_FOLLOWLOCATION,1L);
 
-    /* provide a write callback even for HEAD (curl may call it with 0 bytes) */
     MemBuf resp = {0};
     curl_easy_setopt(ch, CURLOPT_WRITEFUNCTION, membuf_write);
     curl_easy_setopt(ch, CURLOPT_WRITEDATA,     &resp);
@@ -740,4 +821,71 @@ int s3_exists(const S3Creds *creds, const char *bucket, const char *key)
     if (http_code == 200) return 1;
     if (http_code == 404) return 0;
     return -1;
+}
+
+int s3_check_lock(const S3Creds *creds, const char *bucket, const char *key,
+                  char *mode_out,  size_t mode_size,
+                  char *until_out, size_t until_size)
+{
+    ensure_curl_init();
+
+    mode_out[0]  = '\0';
+    until_out[0] = '\0';
+
+    CURL *ch = curl_easy_init();
+    if (!ch) return -1;
+
+    struct curl_slist *hdrs = make_signed_headers(
+        ch, "HEAD", bucket, key, creds, EMPTY_PAYLOAD_SHA256, "", "");
+
+    curl_easy_setopt(ch, CURLOPT_HTTPHEADER,    hdrs);
+    curl_easy_setopt(ch, CURLOPT_NOBODY,        1L);
+    curl_easy_setopt(ch, CURLOPT_FOLLOWLOCATION,1L);
+
+    /* collect response headers (lock info is in response headers, not body) */
+    MemBuf resp_hdrs = {0};
+    curl_easy_setopt(ch, CURLOPT_HEADERFUNCTION, membuf_write);
+    curl_easy_setopt(ch, CURLOPT_HEADERDATA,     &resp_hdrs);
+
+    /* discard response body */
+    MemBuf resp_body = {0};
+    curl_easy_setopt(ch, CURLOPT_WRITEFUNCTION, membuf_write);
+    curl_easy_setopt(ch, CURLOPT_WRITEDATA,     &resp_body);
+
+    CURLcode rc = curl_easy_perform(ch);
+    long http_code = 0;
+    curl_easy_getinfo(ch, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(ch);
+    free(resp_body.data);
+
+    if (rc != CURLE_OK) {
+        free(resp_hdrs.data);
+        fprintf(stderr, "s3: verify-lock failed: %s\n",
+                curl_easy_strerror(rc));
+        return -1;
+    }
+    if (http_code == 404) {
+        free(resp_hdrs.data);
+        fprintf(stderr, "s3: object not found: s3://%s/%s\n", bucket, key);
+        return -1;
+    }
+    if (http_code < 200 || http_code >= 300) {
+        free(resp_hdrs.data);
+        fprintf(stderr, "s3: verify-lock HTTP %ld for s3://%s/%s\n",
+                http_code, bucket, key);
+        return -1;
+    }
+
+    /* parse Object Lock response headers (present only when object is locked) */
+    if (resp_hdrs.data) {
+        resp_header_val(resp_hdrs.data,
+                        "x-amz-object-lock-mode",
+                        mode_out, mode_size);
+        resp_header_val(resp_hdrs.data,
+                        "x-amz-object-lock-retain-until-date",
+                        until_out, until_size);
+        free(resp_hdrs.data);
+    }
+    return 0;
 }

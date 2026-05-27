@@ -21,12 +21,15 @@ shrinker export     output.logz --format json > audit.jsonl
 
 ## Commands (C binary — c_src/shrinker, all implemented):
 ./shrinker compress   <input> <output.logz>
-./shrinker append     <input> <archive.logz>   # creates archive if absent
+./shrinker compress   <input> s3://bucket/key   [--lock DAYS]  # Object Lock Compliance
+./shrinker append     <input> <archive.logz>    # creates archive if absent
+./shrinker append     <input> s3://bucket/key   [--lock DAYS]
 ./shrinker search     <file.logz> <query> [--from DATE] [--to DATE]
                       [--user X] [--ip X] [--action X] [--level X]
 ./shrinker verify     <file.logz>
 ./shrinker decompress <file.logz> <output.log>
 ./shrinker export     <file.logz> [--from DATE] [--to DATE] [--format csv|json]
+./shrinker verify-lock s3://bucket/key          # check Object Lock status
 ./shrinker inspect    <file.logz>   # prints header, jump table summary, totals
 
 ## Proven benchmark numbers (already validated):
@@ -83,7 +86,7 @@ IMPORTANT: Decompression failure on a chunk is treated as TAMPERED (exit 1), not
 Phase 2 — Compliance Features in Python. COMPLETE.
 Phase 3 — C core rewrite. Steps 10–21 complete.
 Phase 4 — CI / packaging. Steps 22–24 complete.
-Phase 5 — S3 integration. Step 27 complete.
+Phase 5 — S3 + Object Lock. Steps 27–28 complete.
 
 Phase 2 steps (all done):
 Steps 1-2 DONE: SHA-256 hash chain in compress.py, verify command in verify.py + cli.py.
@@ -274,7 +277,8 @@ Step 24 DONE: install.sh one-liner installer.
     --version confirmed
   - One-liner: curl -fsSL https://raw.githubusercontent.com/dcolnaric/shrinker/main/install.sh | sh
 
-Step 27 DONE: S3 direct read/write with AWS SigV4 auth (Phase 5).
+Phase 5 steps:
+Step 27 DONE: S3 direct read/write with AWS SigV4 auth.
   - All subcommands accept s3://bucket/key paths for file/archive arguments
   - compress, append: write to temp file then PUT to S3
   - search, verify, decompress, export: GET from S3 to temp file then operate
@@ -311,10 +315,47 @@ Step 27 DONE: S3 direct read/write with AWS SigV4 auth (Phase 5).
   - Local debug/valgrind builds require: sudo apt-get install libcurl4-openssl-dev
   - Static release builds use Alpine containers (curl-dev + curl-static)
 
+Step 28 DONE: S3 Object Lock Compliance Mode — --lock flag + verify-lock subcommand.
+  - New flag: --lock DAYS on compress and append
+      * Only valid with an S3 output/archive path; error printed if used with local path
+      * DAYS must be > 0; error printed otherwise
+      * 2555 = 7 years (SOX), 365 = 1 year (SOC 2), 2190 = 6 years (HIPAA)
+  - Object Lock implementation in s3.c / s3.h:
+      * compute_lock_until(days): time(NULL) + days×86400 formatted as %Y-%m-%dT%H:%M:%SZ
+      * s3_upload() gains int lock_days parameter
+      * When lock_days > 0: lock_mode = "COMPLIANCE", retain-until computed
+      * Two extra signed headers added to SigV4 canonical request (in alphabetical order):
+          x-amz-object-lock-mode: COMPLIANCE
+          x-amz-object-lock-retain-until-date: <ISO 8601 UTC>
+        Alphabetical position: after x-amz-date, before x-amz-security-token
+      * sigv4_build_auth(): 4 combinations (lock × session-token) for signed_hdrs string
+      * Response body captured on PUT to detect Object Lock config errors; specific
+        message printed when bucket was not created with Object Lock enabled
+  - New subcommand: shrinker verify-lock s3://bucket/key [--region R]
+      * HEAD request via s3_check_lock() (new s3.h / s3.c function)
+      * Response headers captured with CURLOPT_HEADERFUNCTION + membuf_write
+      * resp_header_val() helper: case-insensitive line-by-line header scanner
+      * Extracts x-amz-object-lock-mode and x-amz-object-lock-retain-until-date
+      * Prints "LOCKED — COMPLIANCE mode, retain until YYYY-MM-DD"
+           or "NOT LOCKED — no Object Lock on this object"
+      * Returns 0 on success, 1 on error, 2 on usage error
+  - main.c:
+      * tmp_to_s3() gains int lock_days parameter; passes to s3_upload()
+      * compress handler: parses --lock N, validates N > 0 and S3 output required
+      * append handler: same validation; direct s3_upload() call also updated
+      * help_compress() + help_append(): --lock DAYS documented with examples
+      * help_root(): verify-lock listed in commands section
+      * help_verify_lock(): full help text
+      * verify-lock subcommand handler: validates S3 URL, calls s3_check_lock(),
+        formats retain-until date (ISO 8601 → YYYY-MM-DD for readability)
+      * VERSION_STRING bumped to 0.2.1
+  - Validation without real AWS: syntax-only with stub curl.h; full link in Alpine CI
+  - Design: lock_days lives in S3 transport layer only (s3_upload / tmp_to_s3);
+    compress_file() and append_file() remain pure local-file operations — clean separation
+
 Next: Possible next steps:
-  - Step 25: S3 Object Lock integration (WORM compliance for SOX/HIPAA)
-  - Step 26: C test suite (replace run_tests.py with a C test runner)
-  - Step 28: Real S3 round-trip integration test in CI (LocalStack)
+  - Step 29: C test suite (replace run_tests.py with a C test runner)
+  - Step 30: Real S3 round-trip integration test in CI (LocalStack)
 
 ## Strategic pivot (confirmed — do not second-guess):
 ORIGINAL: DevOps cold storage cost savings tool
@@ -356,17 +397,18 @@ shrinker/
       shrinker.h   # all format constants (MAGIC, VERSION, CHUNK_SIZE, bloom sizes, etc.),
                    # JumpEntry + FileFooter structs with _Static_assert size checks, public API
       s3.h         # S3Url + S3Creds structs; s3_is_url / s3_parse_url / s3_load_creds /
-                   # s3_download / s3_upload / s3_exists declarations
+                   # s3_download / s3_upload(+lock_days) / s3_exists / s3_check_lock declarations
     src/
-      main.c       # CLI dispatcher: compress/append/search/verify/decompress/export subcommands;
-                   # S3 routing (s3_to_tmp / tmp_to_s3 helpers); --region flag on all commands
+      main.c       # CLI dispatcher: compress/append/search/verify/decompress/export/verify-lock;
+                   # S3 routing (s3_to_tmp / tmp_to_s3 helpers); --region on all commands;
+                   # --lock DAYS on compress/append; verify-lock subcommand
       compress.c   # compress_file(): full C compression pipeline, byte-compatible with Python
       append.c     # append_file(): extend existing archive in-place, continues hash chain
       search.c     # search_file(): three-layer skip + surgical decompress + grep
       verify.c     # verify_file(): SHA-256 hash chain recomputation, TAMPERED/VERIFIED output
       decompress.c # decompress_file(): sequential full decompression, byte-exact round-trip
       export.c     # export_file(): CSV/JSONL export with Python-compatible escaping
-      s3.c         # AWS SigV4 + libcurl: credential chain, GET/PUT/HEAD S3 operations
+      s3.c         # AWS SigV4 + libcurl: credential chain, GET/PUT/HEAD; Object Lock COMPLIANCE
     Makefile       # debug/valgrind/release targets; LIBS includes -lcurl -lz;
                    # EXTRA_CFLAGS overridable for static builds
   .github/
@@ -419,6 +461,13 @@ shrinker/
 - Local debug builds need: sudo apt-get install libcurl4-openssl-dev
 - Alpine static link order: -lcurl -lzstd -lssl -lcrypto -lz -lm -lpthread -ldl
   (curl-static + zlib-static packages required in addition to existing openssl-libs-static)
+- Object Lock headers are part of SigV4 signed-headers (alphabetical order):
+  host < x-amz-content-sha256 < x-amz-date < x-amz-object-lock-mode
+  < x-amz-object-lock-retain-until-date < x-amz-security-token
+  Unsigned Object Lock headers would let the lock date be tampered in transit
+- lock_days lives in S3 transport layer only; compress_file/append_file are pure local ops
+- verify-lock is read-only (HEAD request); it never downloads the archive
+- resp_header_val() case-insensitive scan handles header name variations across regions
 
 ## What we are NOT building:
 - Not a database

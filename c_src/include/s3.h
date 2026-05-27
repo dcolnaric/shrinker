@@ -1,17 +1,12 @@
 /*
- * s3.h — S3 direct read/write (Phase 5 Step 27)
+ * s3.h — S3 direct read/write (Phase 5 Steps 27–28)
  *
  * Public API for reading from and writing to Amazon S3 using libcurl
- * and AWS Signature Version 4.  All S3 operations go through:
+ * and AWS Signature Version 4.
  *
- *   1. s3_load_creds() — standard AWS credential chain
- *   2. s3_download()   — GET object to local temp file
- *   3. s3_upload()     — PUT local file to object
- *   4. s3_exists()     — HEAD to check existence before append
- *
- * main.c detects "s3://" prefixes, calls these helpers, and routes to
- * the existing local-file functions (compress_file, search_file, …).
- * The core logic is unchanged — S3 is a pure transport layer.
+ * Step 27: basic GET / PUT / HEAD operations with credential chain.
+ * Step 28: Object Lock Compliance Mode (--lock DAYS on compress/append)
+ *          and verify-lock subcommand.
  *
  * Authentication follows the standard AWS credential chain:
  *   1. Environment: AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY
@@ -24,6 +19,8 @@
 
 #ifndef S3_H
 #define S3_H
+
+#include <stddef.h>   /* size_t */
 
 /* -------------------------------------------------------------------------
  * Parsed s3://bucket/key URL
@@ -75,12 +72,36 @@ int s3_download(const S3Creds *creds, const char *bucket, const char *key,
 
 /* Upload local_path to s3://bucket/key.
  * Computes the SHA-256 of the file before uploading (required by SigV4).
+ *
+ * lock_days > 0: Apply S3 Object Lock in COMPLIANCE mode.
+ *   Sets x-amz-object-lock-mode: COMPLIANCE
+ *   Sets x-amz-object-lock-retain-until-date: <today + lock_days>
+ *   These headers are included in the SigV4 signed-headers list.
+ *   The bucket must have Object Lock enabled at creation time.
+ *   If not, AWS returns 400 InvalidRequest; a clear error is printed.
+ *
+ * lock_days = 0: no lock (default, backward-compatible).
+ *
  * Returns 0 on success, -1 on any failure (prints error to stderr). */
 int s3_upload(const S3Creds *creds, const char *bucket, const char *key,
-              const char *local_path);
+              const char *local_path, int lock_days);
 
 /* Check whether s3://bucket/key exists (HEAD request).
  * Returns 1 = exists, 0 = not found (404), -1 = error. */
 int s3_exists(const S3Creds *creds, const char *bucket, const char *key);
+
+/* Check the Object Lock status of s3://bucket/key (HEAD request).
+ * On success:
+ *   If the object is locked:  mode_out = "COMPLIANCE" (or "GOVERNANCE"),
+ *                             until_out = ISO 8601 retain-until date.
+ *   If the object is unlocked: mode_out[0] = '\0', until_out[0] = '\0'.
+ *   Returns 0.
+ * On error (object not found, I/O failure, etc.): returns -1.
+ *
+ * mode_out  — caller-supplied buffer (recommend ≥ 32 bytes)
+ * until_out — caller-supplied buffer (recommend ≥ 40 bytes) */
+int s3_check_lock(const S3Creds *creds, const char *bucket, const char *key,
+                  char *mode_out,  size_t mode_size,
+                  char *until_out, size_t until_size);
 
 #endif /* S3_H */

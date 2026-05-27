@@ -8,5 +8,7 @@ src/__pycache__/
 tests/__pycache__/
 # Built binary — CI builds it from source
 c_src/shrinker
+# Local stub header for syntax-only builds (no libcurl-dev installed)
+c_src/include/curl/
 CLAUDE.md
 CLAUDE.md:Zone.Identifier

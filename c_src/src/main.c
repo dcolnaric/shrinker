@@ -1,5 +1,5 @@
 /*
- * main.c — Shrinker C CLI (Phase 5 Step 27 — S3 direct read/write)
+ * main.c — Shrinker C CLI (Phase 5 Steps 27–28 — S3 + Object Lock)
  *
  * Provides a complete command-line interface that mirrors src/cli.py exactly.
  * S3 paths (s3://bucket/key) are transparently handled: the binary downloads
@@ -7,13 +7,16 @@
  *
  *   shrinker --help | --version
  *   shrinker compress   <input>      <output>          [--format …] [--region …]
+ *                                                      [--lock DAYS]
  *   shrinker append     <input>      <archive.logz>    [--format …] [--region …]
+ *                                                      [--lock DAYS]
  *   shrinker search     <file.logz>  [query]           [--from …] [--to …]
  *                                    [--user …] [--ip …] [--action …] [--level …]
  *                                    [--region …]
  *   shrinker decompress <file.logz>  --output <file>   [--region …]
  *   shrinker verify     <file.logz>                    [--region …]
  *   shrinker export     <file.logz>  [--from …] [--to …] [--format …] [--region …]
+ *   shrinker verify-lock s3://bucket/key               [--region …]
  *
  * S3 URL format:  s3://bucket/path/to/object.logz
  *
@@ -21,6 +24,7 @@
  *   compress / decompress / export / search / append   0 = ok,       1 = error
  *   verify                                             0 = verified, 1 = tampered,
  *                                                      2 = error
+ *   verify-lock                                        0 = ok,       1 = error
  *   bad arguments / unknown command                    2
  */
 
@@ -38,7 +42,7 @@
  * Version string
  * ------------------------------------------------------------------------- */
 
-#define VERSION_STRING "shrinker 0.2.0 (Phase 5 — S3 read/write)"
+#define VERSION_STRING "shrinker 0.2.1 (Phase 5 — S3 + Object Lock)"
 
 /* -------------------------------------------------------------------------
  * Help strings
@@ -52,12 +56,13 @@ static void help_root(void)
            "Designed for compliance archival (SOC 2, PCI-DSS, HIPAA, SOX).\n"
            "\n"
            "commands:\n"
-           "  compress    Compress a log file to .logz format\n"
-           "  append      Append new entries to an existing archive\n"
-           "  search      Search a .logz file for matching lines\n"
-           "  decompress  Decompress a .logz file back to original bytes\n"
-           "  verify      Verify the SHA-256 hash chain of a .logz file\n"
-           "  export      Export log records to CSV or JSONL\n"
+           "  compress     Compress a log file to .logz format\n"
+           "  append       Append new entries to an existing archive\n"
+           "  search       Search a .logz file for matching lines\n"
+           "  decompress   Decompress a .logz file back to original bytes\n"
+           "  verify       Verify the SHA-256 hash chain of a .logz file\n"
+           "  export       Export log records to CSV or JSONL\n"
+           "  verify-lock  Check S3 Object Lock status of a .logz object\n"
            "\n"
            "global options:\n"
            "  --help       Show this help message\n"
@@ -69,6 +74,11 @@ static void help_root(void)
            "  ~/.aws/credentials, or EC2/ECS IAM role (standard chain).\n"
            "  Region: AWS_DEFAULT_REGION / AWS_REGION, ~/.aws/config, or us-east-1.\n"
            "  Override region per command with --region <region>.\n"
+           "\n"
+           "Object Lock (WORM compliance):\n"
+           "  Use --lock DAYS with compress or append to apply S3 Object Lock\n"
+           "  in Compliance mode.  Requires a bucket created with Object Lock\n"
+           "  enabled.  Examples: 2555 = 7 years (SOX), 365 = 1 year (SOC 2).\n"
            "\n"
            "Run 'shrinker <command> --help' for command-specific help.\n");
 }
@@ -89,11 +99,16 @@ static void help_compress(void)
            "  --format FORMAT  Override auto-detected log format.\n"
            "                   Choices: json, syslog, plaintext\n"
            "  --region REGION  AWS region for S3 (overrides env/config)\n"
+           "  --lock DAYS      Set S3 Object Lock retention in Compliance Mode.\n"
+           "                   Requires an S3 output path and a bucket with\n"
+           "                   Object Lock enabled.  DAYS must be > 0.\n"
+           "                   Examples: 2555 (SOX 7y), 365 (SOC 2 1y)\n"
            "  --help           Show this help message\n"
            "\n"
            "examples:\n"
            "  shrinker compress server.log server.logz\n"
            "  shrinker compress server.log s3://my-bucket/logs/server.logz\n"
+           "  shrinker compress server.log s3://my-bucket/logs/server.logz --lock 2555\n"
            "  shrinker compress server.log server.logz --format json\n");
 }
 
@@ -216,11 +231,40 @@ static void help_append(void)
            "                   new archive.  Ignored for existing archives.\n"
            "                   Choices: json, syslog, plaintext\n"
            "  --region REGION  AWS region for S3 (overrides env/config)\n"
+           "  --lock DAYS      Set S3 Object Lock retention in Compliance Mode.\n"
+           "                   Requires an S3 archive path and a bucket with\n"
+           "                   Object Lock enabled.  DAYS must be > 0.\n"
+           "                   Examples: 2555 (SOX 7y), 365 (SOC 2 1y)\n"
            "  --help           Show this help message\n"
            "\n"
            "examples:\n"
            "  shrinker append server.log archive.logz\n"
-           "  shrinker append /var/log/app.log s3://my-bucket/archive.logz\n");
+           "  shrinker append /var/log/app.log s3://my-bucket/archive.logz\n"
+           "  shrinker append /var/log/app.log s3://my-bucket/archive.logz --lock 365\n");
+}
+
+static void help_verify_lock(void)
+{
+    printf("usage: shrinker verify-lock <s3://bucket/key> [options]\n"
+           "\n"
+           "Check the S3 Object Lock status of a .logz archive.\n"
+           "Prints whether the object is locked in Compliance mode and\n"
+           "the retain-until date.\n"
+           "\n"
+           "arguments:\n"
+           "  s3://bucket/key  S3 URL of the .logz object to check\n"
+           "\n"
+           "options:\n"
+           "  --region REGION  AWS region for S3 (overrides env/config)\n"
+           "  --help           Show this help message\n"
+           "\n"
+           "exit codes:\n"
+           "  0  OK     — lock status retrieved successfully\n"
+           "  1  ERROR  — S3 request failed or object not found\n"
+           "\n"
+           "examples:\n"
+           "  shrinker verify-lock s3://my-bucket/logs/server.logz\n"
+           "  shrinker verify-lock s3://my-bucket/logs/server.logz --region eu-west-1\n");
 }
 
 /* -------------------------------------------------------------------------
@@ -248,6 +292,7 @@ static int has_help(int argc, char *argv[], int from)
  *               Caller must unlink(tmpfile) when done.
  *
  * tmp_to_s3():  upload a local file to an S3 URL.
+ *               lock_days > 0 enables S3 Object Lock Compliance Mode.
  *               Returns 0 on success, -1 on failure.
  * ------------------------------------------------------------------------- */
 
@@ -285,7 +330,7 @@ static int s3_to_tmp(const char *s3_url, const char *region_override,
 }
 
 static int tmp_to_s3(const char *local_path, const char *s3_url,
-                     const char *region_override)
+                     const char *region_override, int lock_days)
 {
     S3Url s3u;
     if (s3_parse_url(s3_url, &s3u) != 0) {
@@ -298,7 +343,7 @@ static int tmp_to_s3(const char *local_path, const char *s3_url,
         strncpy(creds.region, region_override, sizeof(creds.region) - 1);
 
     fprintf(stderr, "Uploading to s3://%s/%s ...\n", s3u.bucket, s3u.key);
-    return s3_upload(&creds, s3u.bucket, s3u.key, local_path);
+    return s3_upload(&creds, s3u.bucket, s3u.key, local_path, lock_days);
 }
 
 /* -------------------------------------------------------------------------
@@ -324,8 +369,10 @@ int main(int argc, char *argv[])
     /* ------------------------------------------------------------------
      * compress
      *   shrinker compress <input> <output> [--format F] [--region R]
+     *                                      [--lock DAYS]
      *
      *   If <output> is s3://…: compress to a temp file, upload, delete.
+     *   --lock requires an S3 output path.
      * ------------------------------------------------------------------ */
     if (strcmp(argv[1], "compress") == 0) {
         if (has_help(argc, argv, 2)) { help_compress(); return 0; }
@@ -341,6 +388,7 @@ int main(int argc, char *argv[])
         const char *output          = argv[3];
         int         format_override = -1;
         const char *region_override = NULL;
+        int         lock_days       = 0;
 
         for (int i = 4; i < argc; i++) {
             if (strcmp(argv[i], "--format") == 0) {
@@ -364,14 +412,33 @@ int main(int argc, char *argv[])
                     return 2;
                 }
                 region_override = argv[++i];
+            } else if (strcmp(argv[i], "--lock") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "compress: --lock requires an argument\n");
+                    return 2;
+                }
+                lock_days = atoi(argv[++i]);
+                if (lock_days <= 0) {
+                    fprintf(stderr,
+                        "compress: --lock DAYS must be a positive integer "
+                        "(e.g. 365 for SOC 2, 2555 for SOX 7y)\n");
+                    return 2;
+                }
             } else {
                 fprintf(stderr, "compress: unknown option '%s'\n", argv[i]);
                 return 2;
             }
         }
 
+        /* --lock is only meaningful with an S3 output */
+        if (lock_days > 0 && !s3_is_url(output)) {
+            fprintf(stderr,
+                "compress: --lock requires an S3 output path (s3://...)\n");
+            return 2;
+        }
+
         if (s3_is_url(output)) {
-            /* compress → temp, then upload */
+            /* compress → temp, then upload (with optional Object Lock) */
             char tmpfile[64];
             strcpy(tmpfile, "/tmp/shrinker_XXXXXX");
             int fd = mkstemp(tmpfile);
@@ -380,7 +447,7 @@ int main(int argc, char *argv[])
 
             int rc = compress_file(input, tmpfile, format_override);
             if (rc == 0) {
-                if (tmp_to_s3(tmpfile, output, region_override) != 0)
+                if (tmp_to_s3(tmpfile, output, region_override, lock_days) != 0)
                     rc = 1;
             }
             unlink(tmpfile);
@@ -634,13 +701,15 @@ int main(int argc, char *argv[])
     /* ------------------------------------------------------------------
      * append
      *   shrinker append <input> <archive.logz> [--format F] [--region R]
+     *                                          [--lock DAYS]
      *
      *   If <archive> is s3://…:
      *     • Check if the object exists.
      *     • If it exists: download to temp.
      *     • Run append_file(input, temp, format_override).
-     *     • Upload temp back to S3.
+     *     • Upload temp back to S3 (with optional Object Lock).
      *     • Delete temp.
+     *   --lock requires an S3 archive path.
      * ------------------------------------------------------------------ */
     if (strcmp(argv[1], "append") == 0) {
         if (has_help(argc, argv, 2)) { help_append(); return 0; }
@@ -657,6 +726,7 @@ int main(int argc, char *argv[])
         const char *archive         = argv[3];
         int         format_override = -1;
         const char *region_override = NULL;
+        int         lock_days       = 0;
 
         for (int i = 4; i < argc; i++) {
             if (strcmp(argv[i], "--format") == 0) {
@@ -680,10 +750,29 @@ int main(int argc, char *argv[])
                     return 2;
                 }
                 region_override = argv[++i];
+            } else if (strcmp(argv[i], "--lock") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "append: --lock requires an argument\n");
+                    return 2;
+                }
+                lock_days = atoi(argv[++i]);
+                if (lock_days <= 0) {
+                    fprintf(stderr,
+                        "append: --lock DAYS must be a positive integer "
+                        "(e.g. 365 for SOC 2, 2555 for SOX 7y)\n");
+                    return 2;
+                }
             } else {
                 fprintf(stderr, "append: unknown option '%s'\n", argv[i]);
                 return 2;
             }
+        }
+
+        /* --lock is only meaningful with an S3 archive */
+        if (lock_days > 0 && !s3_is_url(archive)) {
+            fprintf(stderr,
+                "append: --lock requires an S3 archive path (s3://...)\n");
+            return 2;
         }
 
         if (s3_is_url(archive)) {
@@ -727,10 +816,12 @@ int main(int argc, char *argv[])
             /* append locally (creates archive if tmpfile absent) */
             int rc = append_file(input, tmpfile, format_override);
             if (rc == 0) {
-                /* upload the updated (or freshly created) archive */
+                /* upload the updated (or freshly created) archive,
+                 * applying Object Lock if requested */
                 fprintf(stderr, "Uploading to s3://%s/%s ...\n",
                         s3u.bucket, s3u.key);
-                if (s3_upload(&creds, s3u.bucket, s3u.key, tmpfile) != 0)
+                if (s3_upload(&creds, s3u.bucket, s3u.key, tmpfile,
+                              lock_days) != 0)
                     rc = 1;
             }
             unlink(tmpfile);
@@ -742,11 +833,92 @@ int main(int argc, char *argv[])
     }
 
     /* ------------------------------------------------------------------
+     * verify-lock
+     *   shrinker verify-lock <s3://bucket/key> [--region R]
+     *
+     *   Issues a HEAD request to S3 and inspects the Object Lock response
+     *   headers.  Prints the lock status and retain-until date.
+     *   Returns 0 on success, 1 on error.
+     * ------------------------------------------------------------------ */
+    if (strcmp(argv[1], "verify-lock") == 0) {
+        if (has_help(argc, argv, 2)) { help_verify_lock(); return 0; }
+
+        if (argc < 3) {
+            fprintf(stderr,
+                    "verify-lock: missing required argument "
+                    "<s3://bucket/key>\n\n");
+            help_verify_lock();
+            return 2;
+        }
+
+        const char *url             = argv[2];
+        const char *region_override = NULL;
+
+        for (int i = 3; i < argc; i++) {
+            if (strcmp(argv[i], "--region") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr,
+                            "verify-lock: --region requires an argument\n");
+                    return 2;
+                }
+                region_override = argv[++i];
+            } else {
+                fprintf(stderr, "verify-lock: unknown option '%s'\n", argv[i]);
+                return 2;
+            }
+        }
+
+        if (!s3_is_url(url)) {
+            fprintf(stderr,
+                "verify-lock: argument must be an S3 URL (s3://bucket/key)\n");
+            return 2;
+        }
+
+        S3Url s3u;
+        if (s3_parse_url(url, &s3u) != 0) {
+            fprintf(stderr, "verify-lock: invalid S3 URL: %s\n", url);
+            return 1;
+        }
+
+        S3Creds creds;
+        if (s3_load_creds(&creds) != 0) return 1;
+        if (region_override)
+            strncpy(creds.region, region_override, sizeof(creds.region) - 1);
+
+        char mode[32]  = "";
+        char until[40] = "";
+
+        if (s3_check_lock(&creds, s3u.bucket, s3u.key, mode, sizeof(mode),
+                          until, sizeof(until)) != 0) {
+            /* error already printed by s3_check_lock */
+            return 1;
+        }
+
+        if (mode[0] != '\0') {
+            /* Trim ISO 8601 timestamp to date part for readability:
+             * "2032-05-27T00:00:00Z" → "2032-05-27" */
+            char date[11] = "";
+            if (strlen(until) >= 10) {
+                strncpy(date, until, 10);
+                date[10] = '\0';
+            } else {
+                strncpy(date, until, sizeof(date) - 1);
+            }
+            printf("LOCKED — %s mode, retain until %s\n", mode, date);
+        } else {
+            printf("NOT LOCKED — no Object Lock on this object\n");
+        }
+
+        return 0;
+    }
+
+    /* ------------------------------------------------------------------
      * Unknown subcommand
      * ------------------------------------------------------------------ */
     fprintf(stderr,
             "shrinker: unknown command '%s'\n\n"
-            "valid commands: compress, append, search, decompress, verify, export\n"
+            "valid commands: compress, append, search, decompress, verify, "
+            "export, verify-lock\n"
             "Run 'shrinker --help' for usage.\n",
             argv[1]);
     return 2;
